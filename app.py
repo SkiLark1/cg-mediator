@@ -3,20 +3,36 @@ from typing import Dict, Any, Optional, List, Tuple
 from fastapi import FastAPI, HTTPException, Query
 import httpx
 
-# ── Config (env with sane defaults)
+# =============================
+# Configuration (env + defaults)
+# =============================
 TLD_BASE       = os.getenv("TLD_BASE", "https://5star.tldcrm.com")
 ING_BASE       = os.getenv("ING_BASE", "SRMEDTI_")
 READY_MIN      = int(os.getenv("READY_MIN", "2"))
-IDLE_THRESHOLD = int(os.getenv("IDLE_THRESHOLD", "60"))       # seconds
+IDLE_THRESHOLD = int(os.getenv("IDLE_THRESHOLD", "60"))  # seconds
 HTTP_TIMEOUT   = float(os.getenv("HTTP_TIMEOUT", "2.0"))
 
 # Egress auth (for /api/egress/tldialer/*)
 TLD_API_ID  = os.getenv("TLD_API_ID")
 TLD_API_KEY = os.getenv("TLD_API_KEY")
 
-# Agents endpoint discovery
+# If set, allow mapping a campaign → ingroup base when the row is missing ingroup fields (common for CLOSER)
+ALLOW_CAMPAIGN_FALLBACK = os.getenv("ALLOW_CAMPAIGN_FALLBACK", "0") not in ("0", "", "false", "False")
+
+# Map campaign_id → ingroup base
+CAMPAIGN_TO_ING: Dict[str, str] = {
+    "EZSALES": "SREZMEDI_",
+    "MTSALES": "SRMEDTI_",
+}
+
+# Statuses that count toward "duration-based acceptance"
+READYLIKE_STATUSES = {"closer", "ready"}
+
+# Agent endpoint discovery
 ENV_AGENT_STATUS_PATH = (os.getenv("AGENT_STATUS_PATH") or "").strip() or None
 AGENT_ENDPOINT_CANDIDATES = [
+    "/api/egress/tldialer/vicidial_live_agents",  # preferred (needs egress auth)
+    # public legacy candidates (kept for portability with other tenants)
     "/api/public/dialer/live-agents",
     "/api/public/dialer/live_agents",
     "/api/public/dialer/agents",
@@ -24,27 +40,18 @@ AGENT_ENDPOINT_CANDIDATES = [
     "/api/public/agents",
     "/api/public/report/live_agents",
     "/api/public/report/agents/live",
-    # NOTE: we actually discover egress too via ENV var, above list stays public only
 ]
 _agent_path_cache: Optional[Tuple[str, float]] = None
 AGENT_PATH_CACHE_TTL = 300.0  # seconds
-
-# READY/CLOSER duration logic
-READYLIKE_STATUSES = {"ready", "closer"}  # evaluate durations only for these
-# Allow matching READY/CLOSER rows by campaign when ingroup/state fields are missing.
-ALLOW_CAMPAIGN_FALLBACK = bool(int(os.getenv("ALLOW_CAMPAIGN_FALLBACK", "1")))
-CAMPAIGN_BY_ING = {
-    "SREZMEDI_": "EZSALES",   # EZ Mediquote Sales
-    "SRMEDTI_":  "MTSALES",   # Medicare Today Sales
-}
 
 # Counts/idle fallback state
 idle_since: Dict[str, float] = {}
 
 app = FastAPI(title="CallGrid Acceptance Mediator")
 
-# ── Helpers
-
+# ===========
+# Helpers
+# ===========
 def area_code_from_phone(p: str) -> str:
     m = re.search(r"(\d{10})$", re.sub(r"\D", "", p or ""))
     return (m.group(1)[0:3] if m else "UNK")
@@ -56,7 +63,7 @@ def normalize_rows(data: Any) -> List[Dict[str, Any]]:
     if isinstance(data, list):
         return [r for r in data if isinstance(r, dict)]
     if isinstance(data, dict):
-        for k in ("agents", "data", "rows", "results"):
+        for k in ("results", "agents", "data", "rows"):
             v = data.get(k)
             if isinstance(v, list):
                 return [r for r in v if isinstance(r, dict)]
@@ -74,97 +81,102 @@ def parse_hhmmss_to_seconds(s: Any) -> Optional[int]:
         return int(s)
     return None
 
-def pick(obj: Dict[str, Any], keys: List[str]) -> Any:
+def pick(obj: Dict[str, Any], keys: List[str], lower_ok: bool = True) -> Any:
     for k in keys:
         if k in obj:
             return obj[k]
-    low = {str(k).lower(): v for k, v in obj.items()}
-    for k in keys:
-        lk = k.lower()
-        if lk in low:
-            return low[lk]
+    if lower_ok:
+        low = {str(k).lower(): v for k, v in obj.items()}
+        for k in keys:
+            lk = k.lower()
+            if lk in low:
+                return low[lk]
     return None
 
+def collapse_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+def suffix_after_underscore(s: str) -> Optional[str]:
+    """SREZMEDI_FL → FL"""
+    if not s:
+        return None
+    m = re.search(r"_([A-Z]{2})$", str(s).upper())
+    return m.group(1) if m else None
+
 def row_status(row: Dict[str, Any]) -> str:
-    s = pick(row, [
-        "live_status", "Live Status", "status", "Status", "agent status"
-    ]) or ""
+    s = pick(row, ["live_status", "Live Status", "status", "Status", "agent status"]) or ""
     return str(s).strip().lower()
 
 def row_status_duration_seconds(row: Dict[str, Any]) -> Optional[int]:
     dur = pick(row, [
-        "last_state_duration",  # egress live_agents
-        "Status Duration","status duration","duration","status_duration","live status duration"
+        "last_state_duration",  # vicidial_live_agents
+        "Status Duration", "status duration", "duration", "status_duration", "live status duration"
     ])
     return parse_hhmmss_to_seconds(dur)
 
-def ingroup_label(row: Dict[str, Any]) -> str:
-    # Human label (collapse spaces) if present
-    lbl = pick(row, ["call_ingroup_group_name", "ingroup", "call ingroup name",
-                     "call campaign / ingroup", "campaign / ingroup"])
-    if lbl is None:
-        return ""
-    return re.sub(r"\s+", " ", str(lbl)).strip()
-
-def strict_match_ingroup_state(row: Dict[str, Any], ing_base: str, st: Optional[str]) -> bool:
-    """
-    True only if row clearly references the desired ingroup/state
-    via either coded id (call_campaign_id like SREZMEDI_FL) or human label "... FL".
-    """
-    ing_up = ing_base.strip().upper()
-    label_up = ingroup_label(row).upper()
-    ccid = str(pick(row, ["call_campaign_id"]) or "").strip().upper()
-
-    if st:
-        st_up = st.strip().upper()
-        if ccid == f"{ing_up}{st_up}":
-            return True
-        if label_up.endswith(f" {st_up}") and ing_up in label_up.replace("  ", " "):
-            return True
-        return False
-
-    # Base-only (rare): accept exact ingroup or prefix
-    if ccid == ing_up or ccid.startswith(ing_up):
-        return True
-    if label_up.startswith(ing_up) or label_up == ing_up:
-        return True
-    return False
-
-def campaign_fallback_ok(row: Dict[str, Any], ing_base: str) -> bool:
-    """
-    READY/CLOSER rows sometimes drop ingroup fields while still carrying campaign_id.
-    If enabled, accept them by expected campaign for the given ing_base.
-    """
-    if not ALLOW_CAMPAIGN_FALLBACK:
-        return False
-    if row_status(row) not in READYLIKE_STATUSES:
-        return False
-    # Only if we don't already have a label (otherwise strict would have matched)
-    if ingroup_label(row):
-        return False
-    expected_campaign = None
-    for prefix, campaign in CAMPAIGN_BY_ING.items():
-        if ing_base.upper().startswith(prefix):
-            expected_campaign = campaign
-            break
-    if not expected_campaign:
-        return False
-    return str(pick(row, ["campaign_id"]) or "").upper() == expected_campaign.upper()
-
-def row_matches(row: Dict[str, Any], ing_base: str, st: Optional[str]) -> bool:
-    return strict_match_ingroup_state(row, ing_base, st) or campaign_fallback_ok(row, ing_base)
-
 def auth_headers_for(path: str) -> Dict[str, str]:
     if path and path.startswith("/api/egress/tldialer/") and TLD_API_ID and TLD_API_KEY:
+        # TLD lowercases these on the server side, but we send them exactly as specified in their docs
         return {"tld-api-id": TLD_API_ID, "tld-api-key": TLD_API_KEY}
     return {}
 
-# ── TLD calls
+def row_matches_ing_state(
+    row: Dict[str, Any],
+    ing_base: str,
+    st: Optional[str],
+    allow_campaign_fallback: bool
+) -> bool:
+    """
+    True if this agent row is associated with the requested ingroup+state.
+    First try explicit ingroup fields; if missing and allowed, fall back to campaign→ingroup mapping.
+    """
+    ing_up = ing_base.upper()
+    st_up  = (st or "").upper()
 
+    # --- explicit ingroup via code (SREZMEDI_FL) or human label ("SR EZMed Inbound   FL")
+    code   = pick(row, ["call_campaign_id"]) or ""
+    label  = pick(row, ["call_ingroup_group_name"]) or ""
+    label_c = collapse_spaces(str(label))
+    code_up   = str(code).upper()
+    label_up  = label_c.upper()
+
+    if st:
+        if code_up == f"{ing_up}{st_up}":
+            return True
+        if label_up.endswith(f" {st_up}"):
+            return True
+    else:
+        # base-only match (rare for our use, but keep it symmetrical)
+        if code_up.startswith(ing_up) or label_up.startswith(ing_up):
+            return True
+
+    # --- campaign → ingroup fallback (handles CLOSER where ingroup fields are often blank)
+    if allow_campaign_fallback:
+        campaign = (pick(row, ["campaign_id"]) or "").upper()
+        mapped   = CAMPAIGN_TO_ING.get(campaign)
+        if mapped and mapped.upper() == ing_up:
+            # If the state is visible anywhere (code/label), require it; otherwise allow when caller asked a single state.
+            # code might be "", but try to recover a suffix
+            state_from_code  = suffix_after_underscore(code_up)
+            state_from_label = suffix_after_underscore(label_up.replace(" ", "_"))
+            visible_state = state_from_code or state_from_label
+            if st:
+                if visible_state:
+                    return visible_state == st_up
+                # no visible state on row; accept since caller asked for a specific state
+                return True
+            else:
+                return True
+
+    return False
+
+# ===========
+# TLD calls
+# ===========
 async def tld_ready(client: httpx.AsyncClient, phone: str, extra: Dict[str, Any]) -> Dict[str, Any]:
     base_params = {
         "ava": 1,
-        "ing": ING_BASE,   # may be overridden
+        "ing": ING_BASE,   # may be overridden by extra["ing"]
         "sta": "true",
         "cnt": "true",
         "act": "true",
@@ -178,10 +190,6 @@ async def tld_ready(client: httpx.AsyncClient, phone: str, extra: Dict[str, Any]
     return r.json()
 
 async def discover_agents_endpoint(client: httpx.AsyncClient) -> Optional[str]:
-    """
-    Try env-provided path first (with egress headers if applicable), then public candidates.
-    Cache first 200 OK with list-shaped JSON.
-    """
     global _agent_path_cache
     if _agent_path_cache and _agent_path_cache[1] > time.time():
         return _agent_path_cache[0]
@@ -189,7 +197,9 @@ async def discover_agents_endpoint(client: httpx.AsyncClient) -> Optional[str]:
     candidates: List[str] = []
     if ENV_AGENT_STATUS_PATH:
         candidates.append(ENV_AGENT_STATUS_PATH)
-    candidates.extend([p for p in AGENT_ENDPOINT_CANDIDATES if p != ENV_AGENT_STATUS_PATH])
+    for p in AGENT_ENDPOINT_CANDIDATES:
+        if p not in candidates:
+            candidates.append(p)
 
     for path in candidates:
         try:
@@ -210,8 +220,9 @@ async def tld_agents_live(client: httpx.AsyncClient, path: str) -> List[Dict[str
     r.raise_for_status()
     return normalize_rows(r.json())
 
-# ── Routes
-
+# ===========
+# Routes
+# ===========
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
@@ -222,32 +233,32 @@ async def diag_agents_endpoints():
     return {
         "current_path": path,
         "have_egress_auth": bool(TLD_API_ID and TLD_API_KEY),
-        "allow_campaign_fallback": ALLOW_CAMPAIGN_FALLBACK,
+        "campaign_fallback": bool(ALLOW_CAMPAIGN_FALLBACK),
         "candidates": ([ENV_AGENT_STATUS_PATH] if ENV_AGENT_STATUS_PATH else []) + AGENT_ENDPOINT_CANDIDATES
     }
 
 @app.get("/accept")
 async def accept(
     phone: str = Query(..., min_length=7, max_length=25),
-    ing: Optional[str] = Query(None, description="TLD ingroup base, e.g., SREZMEDI_ or SRMEDTI_"),
+    ing: Optional[str] = Query(None, description="Ingroup base, e.g. SREZMEDI_ or SRMEDTI_"),
     ready_min: Optional[int] = Query(None, description="Override READY_MIN"),
     threshold: Optional[int] = Query(None, description="Override IDLE_THRESHOLD (seconds)"),
-    dry: Optional[int] = Query(0, description="If 1, never accept (for safe testing)"),
+    dry: Optional[int] = Query(0, description="If 1, never accept (safe test)"),
     state: Optional[str] = Query(None, description="Single state (e.g., FL)"),
     states: Optional[str] = Query(None, description="CSV states (e.g., MI,TX,OK)"),
-    raw: Optional[int] = Query(0, description="If 1, include raw upstream JSON for debugging")
+    raw: Optional[int] = Query(0, description="If 1, include raw debug")
 ):
     """
     Accept if:
       - ready_count >= ready_min
-      - OR (agents mode): any agent in {READY, CLOSER} has StatusDuration >= threshold
+      - OR (agents mode): any agent with status in {CLOSER, READY} has StatusDuration >= threshold
       - OR (counts fallback): ava>=1 & queue==0 for ing+state for >= threshold seconds
     """
     ING_THIS = (ing or ING_BASE).strip()
     READY_MIN_THIS = READY_MIN if ready_min is None else int(ready_min)
     IDLE_THRESHOLD_THIS = IDLE_THRESHOLD if threshold is None else int(threshold)
 
-    # state list
+    # parse states
     if states:
         state_list: List[Optional[str]] = [s.strip().upper() for s in states.split(",") if s.strip()]
     elif state:
@@ -261,7 +272,7 @@ async def accept(
             mode = "agents" if agents_path else "counts_fallback"
 
             async def eval_state(st: Optional[str]) -> Dict[str, Any]:
-                # ready counts first (fast path & always available)
+                # 1) counts (always computed)
                 counts = await tld_ready(client, phone, extra={
                     "ing": f"{ING_THIS}{st}" if st else ING_THIS,
                     "sta": "false" if st else "true"
@@ -270,38 +281,38 @@ async def accept(
                 ready_ge_min = ready_count >= READY_MIN_THIS
 
                 if agents_path:
-                    # AGENTS MODE (duration-based)
+                    # 2) duration via live agents
                     rows = await tld_agents_live(client, agents_path)
                     max_duration = 0
                     matched: List[Dict[str, Any]] = []
 
                     for row in rows:
                         try:
-                            if not row_matches(row, ING_THIS, st):
-                                continue
                             status_l = row_status(row)
                             if status_l not in READYLIKE_STATUSES:
+                                continue
+                            if not row_matches_ing_state(row, ING_THIS, st, ALLOW_CAMPAIGN_FALLBACK):
                                 continue
                             dur = row_status_duration_seconds(row)
                             if dur is None:
                                 continue
                             d = int(dur)
-                            max_duration = max(max_duration, d)
+                            if d > max_duration:
+                                max_duration = d
                             if raw:
                                 matched.append({
                                     "status": status_l,
                                     "duration": d,
-                                    "label": ingroup_label(row),
-                                    "campaign_id": pick(row, ["campaign_id"]),
+                                    "agent": pick(row, ["agent_full_name", "Agent Full Name", "User", "user", "agent"]),
+                                    "campaign": pick(row, ["campaign_id"]),
                                     "call_campaign_id": pick(row, ["call_campaign_id"]),
-                                    "agent": pick(row, ["Agent Full Name","agent_full_name","User","user","agent"]),
+                                    "call_ingroup_group_name": pick(row, ["call_ingroup_group_name"]),
                                 })
                         except Exception:
                             continue
 
                     waiting_too_long = (max_duration >= IDLE_THRESHOLD_THIS) and (max_duration > 0)
                     candidate = bool(ready_ge_min or waiting_too_long)
-
                     dbg = {
                         "mode": mode,
                         "ing": ING_THIS,
@@ -311,11 +322,11 @@ async def accept(
                         "threshold": IDLE_THRESHOLD_THIS,
                         "ready_ge_min": ready_ge_min,
                         "agents_endpoint": agents_path,
+                        "campaign_fallback": bool(ALLOW_CAMPAIGN_FALLBACK),
                     }
                     if raw:
                         dbg["matched_agents"] = matched[:10]
                         dbg["counts_raw"] = counts
-
                     return {
                         "candidate": candidate,
                         "ready": ready_count,
@@ -324,7 +335,7 @@ async def accept(
                         "debug": dbg
                     }
 
-                # COUNTS FALLBACK (idle timer from ready/queue)
+                # 3) counts-based idle fallback (when no live-agents endpoint available)
                 idle_resp = await tld_ready(client, phone, extra={
                     "ing": f"{ING_THIS}{st}" if st else ING_THIS,
                     "que": 0, "qui": "ing", "ava": 1, "sta": "false" if st else "true"
@@ -348,7 +359,6 @@ async def accept(
 
                 waiting_too_long = idle_age >= IDLE_THRESHOLD_THIS
                 candidate = bool(ready_ge_min or waiting_too_long)
-
                 dbg = {
                     "mode": mode,
                     "ing": ING_THIS,
@@ -362,16 +372,15 @@ async def accept(
                 if raw:
                     dbg["counts_raw"] = counts
                     dbg["idle_probe_raw"] = idle_resp
-
                 return {
                     "candidate": candidate,
                     "ready": ready_count,
-                    "maxStatusDuration": idle_age,   # in fallback this reflects observed idle seconds
+                    "maxStatusDuration": idle_age,
                     "waitingTooLong": waiting_too_long,
                     "debug": dbg
                 }
 
-            # Evaluate requested states
+            # Evaluate states
             per_state: Dict[str, Dict[str, Any]] = {}
             overall_ready = 0
             overall_waiting = False
