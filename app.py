@@ -30,7 +30,7 @@ app = FastAPI(title="CallGrid Acceptance Mediator")
 # ---------- helpers
 
 def area_code_from_phone(p: str) -> str:
-    m = re.search(r"(\d{10})$", re.sub(r"\D", "", p or ""))
+    m = re.search(r"(\\d{10})$", re.sub(r"\\D", "", p or ""))
     return (m.group(1)[0:3] if m else "UNK")
 
 def route_key_from_json(base: str, counts: Dict[str, Any], phone: str) -> str:
@@ -48,11 +48,11 @@ def normalize_rows(data: Any) -> List[Dict[str, Any]]:
                 return [r for r in v if isinstance(r, dict)]
     return []
 
-def parse_hhmmss_to_seconds(s: str) -> Optional[int]:
+def parse_hhmmss_to_seconds(s: Any) -> Optional[int]:
     if s is None:
         return None
     s = str(s).strip()
-    m = re.match(r"^(?:(\d+):)?([0-5]?\d):([0-5]?\d)$", s)  # H:MM:SS or MM:SS
+    m = re.match(r"^(?:(\\d+):)?([0-5]?\\d):([0-5]?\\d)$", s)  # H:MM:SS or MM:SS
     if m:
         h = int(m.group(1) or 0); mm = int(m.group(2)); ss = int(m.group(3))
         return h*3600 + mm*60 + ss
@@ -72,10 +72,6 @@ def pick(obj: Dict[str, Any], keys: List[str]) -> Any:
     return None
 
 def match_ingroup_state(row: Dict[str, Any], ing_base: str, st: Optional[str]) -> bool:
-    """
-    Accept if row's ingroup/campaign matches the requested ing_base (+ optional state).
-    We check several likely column names seen in TLD UIs/APIs.
-    """
     ing_fields = [
         "ingroup", "call ingroup name", "call ingroup", "call campaign / ingroup",
         "campaign / ingroup", "vendor", "campaign", "campaign name"
@@ -117,9 +113,7 @@ async def tld_ready(client: httpx.AsyncClient, phone: str, extra: Dict[str, Any]
     return r.json()
 
 async def discover_agents_endpoint(client: httpx.AsyncClient) -> str:
-    """Find a working per-agent live endpoint and cache it."""
     global _agent_path_cache
-
     # use cache if fresh
     if _agent_path_cache and _agent_path_cache[1] > time.time():
         return _agent_path_cache[0]
@@ -134,10 +128,9 @@ async def discover_agents_endpoint(client: httpx.AsyncClient) -> str:
             url = f"{TLD_BASE}{path}"
             r = await client.get(url, timeout=HTTP_TIMEOUT)
             if r.status_code == 200:
-                rows = normalize_rows(r.json())
-                if rows is not None:  # even empty list is acceptable; shape is OK
-                    _agent_path_cache = (path, time.time() + AGENT_PATH_CACHE_TTL)
-                    return path
+                _ = normalize_rows(r.json())
+                _agent_path_cache = (path, time.time() + AGENT_PATH_CACHE_TTL)
+                return path
         except httpx.HTTPError:
             continue
 
@@ -147,7 +140,6 @@ async def discover_agents_endpoint(client: httpx.AsyncClient) -> str:
     })
 
 async def tld_agents_live(client: httpx.AsyncClient) -> Tuple[str, List[Dict[str, Any]]]:
-    """Return (path_used, agent_rows)."""
     path = await discover_agents_endpoint(client)
     url = f"{TLD_BASE}{path}"
     r = await client.get(url, timeout=HTTP_TIMEOUT)
@@ -163,7 +155,6 @@ async def healthz():
 
 @app.get("/diag/agents-endpoints")
 async def diag_agents_endpoints():
-    """Quick diag: which endpoint is discovered right now."""
     path = _agent_path_cache[0] if _agent_path_cache else None
     return {
         "current_path": path,
@@ -177,45 +168,39 @@ async def accept(
     ready_min: Optional[int] = Query(None, description="Override READY_MIN"),
     threshold: Optional[int] = Query(None, description="Override IDLE_THRESHOLD (seconds)"),
     dry: Optional[int] = Query(0, description="If 1, never accept (for safe testing)"),
-    # state selection
     state: Optional[str] = Query(None, description="Force a single state, e.g., FL"),
     states: Optional[str] = Query(None, description="CSV list of states, e.g., MI,TX,OK"),
-    # debug
     raw: Optional[int] = Query(0, description="If 1, include raw upstream JSON for debugging")
 ):
     """
     Decision:
       accept = (ready_count >= ready_min)
-             or (exists agent in {CLOSER, READY} for ing+state whose StatusDuration >= threshold)
+             OR (exists agent with status in {CLOSER, READY} for ing+state whose StatusDuration >= threshold)
     """
     ING_THIS = (ing or ING_BASE).strip()
     READY_MIN_THIS = READY_MIN if ready_min is None else int(ready_min)
     IDLE_THRESHOLD_THIS = IDLE_THRESHOLD if threshold is None else int(threshold)
 
-    # build state list
     state_list: List[Optional[str]] = []
     if states:
         state_list = [s.strip().upper() for s in states.split(",") if s.strip()]
     elif state:
         state_list = [state.strip().upper()]
     else:
-        state_list = [None]  # base only unless you pass states
+        state_list = [None]
 
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            # fetch agents once; we’ll filter locally
             agents_path, agents_rows = await tld_agents_live(client)
 
             async def eval_state(st: Optional[str]) -> Dict[str, Any]:
-                # counts: fast path for "ready >= ready_min"
                 counts = await tld_ready(client, phone, extra={
                     "ing": f"{ING_THIS}{st}" if st else ING_THIS,
-                    "sta": "false" if st else "true"  # when state forced, don't let TLD append again
+                    "sta": "false" if st else "true"
                 })
                 ready_count = int(counts.get("ready", counts.get("ava", 0)) or 0)
                 ready_ge_min = ready_count >= READY_MIN_THIS
 
-                # from agent rows: only statuses closer/ready, compute max status duration
                 max_duration = 0
                 matched: List[Dict[str, Any]] = []
                 for row in agents_rows:
@@ -261,7 +246,6 @@ async def accept(
                     }
                 }
 
-            # Evaluate all requested states
             per_state: Dict[str, Dict[str, Any]] = {}
             overall_ready = 0
             overall_waiting = False
@@ -284,7 +268,7 @@ async def accept(
                 "shouldAccept": should_accept,
                 "ready": overall_ready,
                 "waitingTooLong": overall_waiting,
-                "idleObservedSeconds": overall_maxdur,  # now = max agent Status Duration (sec)
+                "idleObservedSeconds": overall_maxdur,
                 "debug": {
                     "ing": ING_THIS,
                     "states_evaluated": list(per_state.keys()),
@@ -295,9 +279,7 @@ async def accept(
             }
             if raw:
                 resp["debug"]["agents_endpoint_used"] = agents_path
-                # Include a small sample of raw rows to verify field names
                 resp["debug"]["agents_raw_sample"] = agents_rows[:10]
-
             return resp
 
     except httpx.HTTPError as e:
