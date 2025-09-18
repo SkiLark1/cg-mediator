@@ -11,8 +11,8 @@ IDLE_THRESHOLD = int(os.getenv("IDLE_THRESHOLD", "60"))     # seconds
 HTTP_TIMEOUT   = float(os.getenv("HTTP_TIMEOUT", "2.0"))
 
 # Egress auth (for /api/egress/tldialer/*)
-TLD_API_ID  = (os.getenv("TLD_API_ID") or "").strip()
-TLD_API_KEY = (os.getenv("TLD_API_KEY") or "").strip()
+TLD_API_ID   = os.getenv("TLD_API_ID")
+TLD_API_KEY  = os.getenv("TLD_API_KEY")
 
 # Live-agents endpoint discovery
 READYLIKE_STATUSES = {"closer", "ready"}  # ONLY these count
@@ -131,13 +131,11 @@ def row_status_duration_seconds(row: Dict[str, Any]) -> Optional[int]:
 
 def auth_headers_for(path: str) -> Dict[str, str]:
     """
-    Use egress auth headers only for /api/egress/* paths.
+    Add the TLD API headers for tldialer egress endpoints.
+    These header names are lowercased by TLD internally, but we send as shown.
     """
-    if path.startswith("/api/egress/") and TLD_API_ID and TLD_API_KEY:
-        return {
-            "tld-api-id": TLD_API_ID,
-            "tld-api-key": TLD_API_KEY,
-        }
+    if path and path.startswith("/api/egress/tldialer/") and TLD_API_ID and TLD_API_KEY:
+        return {"tld-api-id": TLD_API_ID, "tld-api-key": TLD_API_KEY}
     return {}
 
 # ---------- TLD calls
@@ -175,7 +173,7 @@ async def discover_agents_endpoint(client: httpx.AsyncClient) -> Optional[str]:
     for path in candidates:
         try:
             url = f"{TLD_BASE}{path}"
-            r = await client.get(url, headers=auth_headers_for(path), timeout=HTTP_TIMEOUT)
+            r = await client.get(url, timeout=HTTP_TIMEOUT, headers=auth_headers_for(path))
             if r.status_code == 200:
                 rows = normalize_rows(r.json())
                 if isinstance(rows, list):  # shape looks good
@@ -187,7 +185,7 @@ async def discover_agents_endpoint(client: httpx.AsyncClient) -> Optional[str]:
 
 async def tld_agents_live(client: httpx.AsyncClient, path: str) -> List[Dict[str, Any]]:
     url = f"{TLD_BASE}{path}"
-    r = await client.get(url, headers=auth_headers_for(path), timeout=HTTP_TIMEOUT)
+    r = await client.get(url, timeout=HTTP_TIMEOUT, headers=auth_headers_for(path))
     r.raise_for_status()
     return normalize_rows(r.json())
 
