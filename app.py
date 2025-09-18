@@ -117,13 +117,21 @@ async def accept(
 
             # Detect idle_now robustly
             idle_now = False
-            if "queue" in idle_resp:
-                try:
-                    idle_now = int(idle_resp["queue"]) == 0 and int(idle_resp.get("ready", 0)) >= 1
-                except Exception:
-                    idle_now = False
+
+            # Try explicit flags first (works for some tenants)
+            if isinstance(idle_resp, dict):
+                if "queue" in idle_resp:
+                    try:
+                        idle_now = int(idle_resp["queue"]) == 0 and int(idle_resp.get("ready", 0)) >= 1
+                    except Exception:
+                        idle_now = False
+                if not idle_now:
+                    idle_now = str(idle_resp.get("val", "0")).lower() in ("1", "true")
+
+            # Fallback (your tenant): if at least one is ready but below the min,
+            # consider that our "idle candidate" to time.
             if not idle_now:
-                idle_now = str(idle_resp.get("val", "0")).lower() in ("1", "true")
+                idle_now = (ready_count >= 1 and not ready_ge_min)
 
             # Build route key using what we actually queried
             effective_ing_for_key = f"{ING_THIS}{force_state}" if force_state else ING_THIS
