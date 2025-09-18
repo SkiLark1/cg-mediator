@@ -55,7 +55,9 @@ async def accept(
     ing: Optional[str] = Query(None, description="TLD ingroup base, e.g., SREZMEDI_ or SRMEDTI_"),
     ready_min: Optional[int] = Query(None, description="Override READY_MIN"),
     threshold: Optional[int] = Query(None, description="Override IDLE_THRESHOLD (seconds)"),
-    dry: Optional[int] = Query(0, description="If 1, never accept (for safe testing)")
+    dry: Optional[int] = Query(0, description="If 1, never accept (for safe testing)"),
+    no_state: Optional[int] = Query(0, description="If 1, disable state suffix (sta=false)"),
+    state: Optional[str] = Query(None, description="Force a specific state suffix, e.g., FL")
 ):
     now = time.time()
 
@@ -64,31 +66,55 @@ async def accept(
     READY_MIN_THIS = READY_MIN if ready_min is None else int(ready_min)
     IDLE_THRESHOLD_THIS = IDLE_THRESHOLD if threshold is None else int(threshold)
 
+    # Decide state behavior
+    force_state = (state or "").strip().upper() or None
+    use_sta_flag = False if no_state else True  # default True unless no_state=1
+
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            # 1) Normal counts (for this ingroup)
-            counts = await tld_ready(client, phone, extra={"ing": ING_THIS})
+            # Helper to call with a given state strategy
+            async def get_counts_and_idle(sta_flag: bool, forced_state: Optional[str]):
+                # If forcing a state, use ing+STATE and sta=false (so TLD doesn't append again)
+                if forced_state:
+                    counts_params = {"ing": f"{ING_THIS}{forced_state}", "sta": "false"}
+                    idle_params   = {"ing": f"{ING_THIS}{forced_state}", "sta": "false", "que": 0, "qui": "ing", "ava": 1}
+                    state_mode = forced_state
+                else:
+                    counts_params = {"ing": ING_THIS, "sta": "true" if sta_flag else "false"}
+                    idle_params   = {"ing": ING_THIS, "sta": "true" if sta_flag else "false", "que": 0, "qui": "ing", "ava": 1}
+                    state_mode = "AUTO" if sta_flag else "NONE"
+
+                counts_resp = await tld_ready(client, phone, extra=counts_params)
+                idle_resp   = await tld_ready(client, phone, extra=idle_params)
+                return counts_resp, idle_resp, state_mode
+
+            # 1) First try with selected strategy (forced-state > no_state > auto)
+            counts, idle_resp, state_mode = await get_counts_and_idle(use_sta_flag, force_state)
             ready_count = int(counts.get("ready", counts.get("ava", 0)) or 0)
+
+            # 2) If auto (sta=true) yielded 0 ready and we didn't force state, fallback once with sta=false
+            fallback_used = False
+            if ready_count == 0 and force_state is None and use_sta_flag:
+                counts, idle_resp, state_mode = await get_counts_and_idle(False, None)
+                ready_count = int(counts.get("ready", counts.get("ava", 0)) or 0)
+                fallback_used = True
+
             ready_ge_min = ready_count >= READY_MIN_THIS
 
-            # 2) "Idle now" signal: queue==0 in ingroup/state AND ava>=1
-            idle_resp = await tld_ready(client, phone, extra={
-                "ing": ING_THIS, "que": 0, "qui": "ing", "ava": 1
-            })
-
+            # Detect idle_now robustly
             idle_now = False
-            # Prefer explicit fields if present
             if "queue" in idle_resp:
                 try:
                     idle_now = int(idle_resp["queue"]) == 0 and int(idle_resp.get("ready", 0)) >= 1
                 except Exception:
                     idle_now = False
-            # Fallback: some setups return { "val": 1 } when constraints matched
             if not idle_now:
                 idle_now = str(idle_resp.get("val", "0")).lower() in ("1", "true")
 
-            # 3) Build a stable key to time persistence (FIXED to use ING_THIS)
-            rk = route_key_from_json(ING_THIS, counts, phone)
+            # Build route key using what we actually queried
+            # If we forced a state, embed it in the ing used for the key.
+            effective_ing_for_key = f"{ING_THIS}{force_state}" if force_state else ING_THIS
+            rk = route_key_from_json(effective_ing_for_key, counts, phone)
 
             if idle_now:
                 idle_since.setdefault(rk, now)
@@ -113,6 +139,8 @@ async def accept(
                     "ready_ge_min": ready_ge_min,
                     "idle_now": idle_now,
                     "route_key": rk,
+                    "state_mode": state_mode,         # "AUTO", "NONE", or forced state like "FL"
+                    "fallback_used": fallback_used,   # True if we retried with sta=false
                     "computed_should_accept": computed_should_accept,
                     "dry_mode": bool(dry),
                 }
