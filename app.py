@@ -79,17 +79,14 @@ def pick(obj: Dict[str, Any], keys: List[str]) -> Any:
     return None
 
 def match_ingroup_state(row: Dict[str, Any], ing_base: str, st: Optional[str]) -> bool:
-    """
-    Accept if row's ingroup/campaign matches the requested ing_base (+ optional state).
-    Supports both UI-ish keys and tldialer snake_case keys.
-    """
     ing_fields = [
-        # UI-ish:
+        # vicidial_live_agents:
+        "call_campaign_id",           # e.g. SREZMEDI_FL
+        "call_ingroup_group_name",    # e.g. SR EZMed Inbound  FL
+
+        # UI/other payloads we already tried:
         "ingroup", "call ingroup name", "call ingroup", "call campaign / ingroup",
-        "campaign / ingroup", "vendor", "campaign", "campaign name",
-        # tldialer snake_case:
-        "call_ingroup_group_name", "call_ingroup_name",
-        "call_campaign_id", "campaign_id"
+        "campaign / ingroup", "vendor", "campaign", "campaign name"
     ]
     val = pick(row, ing_fields)
     if not val:
@@ -98,33 +95,26 @@ def match_ingroup_state(row: Dict[str, Any], ing_base: str, st: Optional[str]) -
     val_up = str(val).strip().upper()
     ing_up = ing_base.strip().upper()
 
-    # If the field is a pure campaign_id (e.g. SREZMEDI_FL), it should
-    # already have the state suffix; just compare directly.
     if st:
         st_up = st.strip().upper()
-        return (
-            val_up == f"{ing_up}{st_up}"      # exact “SREZMEDI_” + “FL”
-            or val_up.endswith(f" {st_up}")   # “… FL”
-            or val_up.endswith(f"_{st_up}")   # “…_FL”
-        )
+        # exact coded id (SREZMEDI_FL) OR human label that ends with " FL"
+        return (val_up == f"{ing_up}{st_up}") or val_up.endswith(f" {st_up}")
     # base only
-    return (
-        val_up == ing_up
-        or val_up.startswith(ing_up)
-    )
+    return val_up == ing_up or val_up.startswith(ing_up)
 
 
 def row_status(row: Dict[str, Any]) -> str:
-    # Add snake_case live_status
-    s = pick(row, ["Live Status", "live_status", "status", "Status", "agent status"]) or ""
+    s = pick(row, [
+        "live_status",              # <-- vicidial_live_agents
+        "Live Status", "status", "Status", "agent status"
+    ]) or ""
     return str(s).strip().lower()
 
 
 def row_status_duration_seconds(row: Dict[str, Any]) -> Optional[int]:
-    # Add snake_case last_state_duration
     dur = pick(row, [
-        "Status Duration", "status duration", "duration", "status_duration",
-        "live status duration", "Last State Duration", "last_state_duration"
+        "last_state_duration",      # <-- vicidial_live_agents
+        "Status Duration","status duration","duration","status_duration","live status duration"
     ])
     return parse_hhmmss_to_seconds(dur)
 
