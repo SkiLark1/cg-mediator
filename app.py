@@ -81,26 +81,30 @@ def pick(obj: Dict[str, Any], keys: List[str]) -> Any:
 def match_ingroup_state(row: Dict[str, Any], ing_base: str, st: Optional[str]) -> bool:
     """
     Accept if the row is in the requested ing_base (+ optional state).
-    We intentionally check BOTH the in-group name and the coded id.
+    We check BOTH the human in-group label and the coded id.
     """
     ing_up = ing_base.strip().upper()
     st_up  = st.strip().upper() if st else None
 
     # Prefer the human in-group label when present, e.g. "SR EZMed Inbound  FL"
     ingroup_label = pick(row, [
-        "call_ingroup_group_name",  # vicidial_live_agents
+        "call_ingroup_group_name",   # vicidial_live_agents
         "Call Ingroup Name", "call ingroup name", "call ingroup",
         "Campaign / Ingroup", "call campaign / ingroup"
     ])
     # Also check the coded id when present, e.g. "SREZMEDI_FL"
     coded_id = pick(row, [
-        "call_campaign_id",         # vicidial_live_agents: often EZSALES or SREZMEDI_FL
+        "call_campaign_id",          # vicidial_live_agents
         "vendor", "ingroup", "campaign", "campaign name"
     ])
 
-    # Normalize
-    label = str(ingroup_label or "").strip().upper()
-    code  = str(coded_id or "").strip().upper()
+    # Normalize: collapse multiple spaces so "Inbound  FL" still matches " FL"
+    def norm(s: Any) -> str:
+        s = str(s or "").upper().strip()
+        return re.sub(r"\s+", " ", s)
+
+    label = norm(ingroup_label)
+    code  = norm(coded_id)
 
     if st_up:
         # Match either the coded id "SREZMEDI_FL" OR a label that ends with " FL"
@@ -108,10 +112,11 @@ def match_ingroup_state(row: Dict[str, Any], ing_base: str, st: Optional[str]) -
         ok_code  = (code == f"{ing_up}{st_up}")
         return ok_label or ok_code
     else:
-        # Base only: allow exact id or prefix on code OR a label starting with our base
+        # Base-only checks
         ok_label = bool(label and label.startswith(ing_up))
         ok_code  = (code == ing_up or code.startswith(ing_up))
         return ok_label or ok_code
+
 
 
 def row_status(row: Dict[str, Any]) -> str:
