@@ -10,10 +10,16 @@ READY_MIN      = int(os.getenv("READY_MIN", "2"))
 IDLE_THRESHOLD = int(os.getenv("IDLE_THRESHOLD", "60"))     # seconds
 HTTP_TIMEOUT   = float(os.getenv("HTTP_TIMEOUT", "2.0"))
 
-# Live-agents endpoint discovery (if tenant supports it)
+# Egress auth (for /api/egress/tldialer/*)
+TLD_API_ID  = (os.getenv("TLD_API_ID") or "").strip()
+TLD_API_KEY = (os.getenv("TLD_API_KEY") or "").strip()
+
+# Live-agents endpoint discovery
 READYLIKE_STATUSES = {"closer", "ready"}  # ONLY these count
 ENV_AGENT_STATUS_PATH = (os.getenv("AGENT_STATUS_PATH") or "").strip() or None
 AGENT_ENDPOINT_CANDIDATES = [
+    # We will try env-provided path first; then candidates below.
+    # Public candidates (no auth)
     "/api/public/dialer/live-agents",
     "/api/public/dialer/live_agents",
     "/api/public/dialer/agents",
@@ -43,7 +49,7 @@ def normalize_rows(data: Any) -> List[Dict[str, Any]]:
     if isinstance(data, list):
         return [r for r in data if isinstance(r, dict)]
     if isinstance(data, dict):
-        for k in ("agents", "data", "rows"):
+        for k in ("agents", "data", "rows", "results"):
             v = data.get(k)
             if isinstance(v, list):
                 return [r for r in v if isinstance(r, dict)]
@@ -75,7 +81,7 @@ def pick(obj: Dict[str, Any], keys: List[str]) -> Any:
 def match_ingroup_state(row: Dict[str, Any], ing_base: str, st: Optional[str]) -> bool:
     ing_fields = [
         "ingroup", "call ingroup name", "call ingroup", "call campaign / ingroup",
-        "campaign / ingroup", "vendor", "campaign", "campaign name"
+        "campaign / ingroup", "vendor", "campaign", "campaign name", "call_campaign_id"
     ]
     val = pick(row, ing_fields)
     if not val:
@@ -88,12 +94,26 @@ def match_ingroup_state(row: Dict[str, Any], ing_base: str, st: Optional[str]) -
     return val_up == ing_up or val_up.startswith(ing_up)
 
 def row_status(row: Dict[str, Any]) -> str:
-    s = pick(row, ["Live Status","status","Status","agent status"]) or ""
+    s = pick(row, ["Live Status","status","Status","agent status","live_status"]) or ""
     return str(s).strip().lower()
 
 def row_status_duration_seconds(row: Dict[str, Any]) -> Optional[int]:
-    dur = pick(row, ["Status Duration","status duration","duration","status_duration","live status duration"])
+    dur = pick(row, [
+        "Status Duration","status duration","duration","status_duration",
+        "live status duration","last_state_duration"
+    ])
     return parse_hhmmss_to_seconds(dur)
+
+def auth_headers_for(path: str) -> Dict[str, str]:
+    """
+    Use egress auth headers only for /api/egress/* paths.
+    """
+    if path.startswith("/api/egress/") and TLD_API_ID and TLD_API_KEY:
+        return {
+            "tld-api-id": TLD_API_ID,
+            "tld-api-key": TLD_API_KEY,
+        }
+    return {}
 
 # ---------- TLD calls
 
@@ -114,28 +134,35 @@ async def tld_ready(client: httpx.AsyncClient, phone: str, extra: Dict[str, Any]
     return r.json()
 
 async def discover_agents_endpoint(client: httpx.AsyncClient) -> Optional[str]:
+    """
+    Try env-provided path first (with egress headers if applicable), then public candidates.
+    Cache on first 200 OK with list-shaped JSON.
+    """
     global _agent_path_cache
     if _agent_path_cache and _agent_path_cache[1] > time.time():
         return _agent_path_cache[0]
-    candidates = []
+
+    candidates: List[str] = []
     if ENV_AGENT_STATUS_PATH:
         candidates.append(ENV_AGENT_STATUS_PATH)
     candidates.extend([p for p in AGENT_ENDPOINT_CANDIDATES if p != ENV_AGENT_STATUS_PATH])
+
     for path in candidates:
         try:
             url = f"{TLD_BASE}{path}"
-            r = await client.get(url, timeout=HTTP_TIMEOUT)
+            r = await client.get(url, headers=auth_headers_for(path), timeout=HTTP_TIMEOUT)
             if r.status_code == 200:
-                _ = normalize_rows(r.json())  # validate shape
-                _agent_path_cache = (path, time.time() + AGENT_PATH_CACHE_TTL)
-                return path
+                rows = normalize_rows(r.json())
+                if isinstance(rows, list):  # shape looks good
+                    _agent_path_cache = (path, time.time() + AGENT_PATH_CACHE_TTL)
+                    return path
         except httpx.HTTPError:
             continue
-    return None  # important: don’t raise; this enables fallback
+    return None  # enables fallback
 
 async def tld_agents_live(client: httpx.AsyncClient, path: str) -> List[Dict[str, Any]]:
     url = f"{TLD_BASE}{path}"
-    r = await client.get(url, timeout=HTTP_TIMEOUT)
+    r = await client.get(url, headers=auth_headers_for(path), timeout=HTTP_TIMEOUT)
     r.raise_for_status()
     return normalize_rows(r.json())
 
@@ -150,6 +177,7 @@ async def diag_agents_endpoints():
     path = _agent_path_cache[0] if _agent_path_cache else None
     return {
         "current_path": path,
+        "have_egress_auth": bool(TLD_API_ID and TLD_API_KEY),
         "candidates": ([ENV_AGENT_STATUS_PATH] if ENV_AGENT_STATUS_PATH else []) + AGENT_ENDPOINT_CANDIDATES
     }
 
@@ -184,7 +212,6 @@ async def accept(
 
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            # Try to get agents endpoint; None => fallback mode
             agents_path = await discover_agents_endpoint(client)
             mode = "agents" if agents_path else "counts_fallback"
 
@@ -218,8 +245,8 @@ async def accept(
                                     "status": status_l,
                                     "duration": int(dur),
                                     "ingroupField": pick(row, ["Call Ingroup Name","ingroup","Call Campaign / Ingroup",
-                                                               "Campaign / Ingroup","campaign","vendor"]),
-                                    "agent": pick(row, ["Agent Full Name","User","user","agent"]),
+                                                               "Campaign / Ingroup","campaign","vendor","call_campaign_id"]),
+                                    "agent": pick(row, ["Agent Full Name","User","user","agent","agent_full_name"]),
                                 })
                         except Exception:
                             continue
@@ -251,7 +278,6 @@ async def accept(
                         "ing": f"{ING_THIS}{st}" if st else ING_THIS,
                         "que": 0, "qui": "ing", "ava": 1, "sta": "false" if st else "true"
                     })
-                    # detect match: either explicit queue field or "val"==1
                     idle_now = False
                     if "queue" in idle_resp:
                         try:
