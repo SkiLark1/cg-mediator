@@ -1,5 +1,5 @@
 import os, time, re
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 from fastapi import FastAPI, HTTPException, Query
 import httpx
 
@@ -9,69 +9,50 @@ ING_BASE       = os.getenv("ING_BASE", "SRMEDTI_")          # default ingroup ba
 READY_MIN      = int(os.getenv("READY_MIN", "2"))           # "more than 1 agent"
 IDLE_THRESHOLD = int(os.getenv("IDLE_THRESHOLD", "60"))     # seconds
 HTTP_TIMEOUT   = float(os.getenv("HTTP_TIMEOUT", "2.0"))
-AGENT_STATUS_PATH = os.getenv("AGENT_STATUS_PATH", "/api/public/agents/live")
-AGENT_STATUS_PATH = os.getenv("AGENT_STATUS_PATH", "/api/public/agents/live")
 
-# Track when (ava>=1 & queue==0) started, per key
-idle_since: Dict[str, float] = {}
+# Live-agents endpoint discovery
+READYLIKE_STATUSES = {"closer", "ready"}  # ONLY these count
+ENV_AGENT_STATUS_PATH = (os.getenv("AGENT_STATUS_PATH") or "").strip() or None
+AGENT_ENDPOINT_CANDIDATES = [
+    "/api/public/dialer/live-agents",
+    "/api/public/dialer/live_agents",
+    "/api/public/dialer/agents",
+    "/api/public/agents/live",
+    "/api/public/agents",
+    "/api/public/report/live_agents",
+    "/api/public/report/agents/live",
+]
+_agent_path_cache: Optional[Tuple[str, float]] = None
+AGENT_PATH_CACHE_TTL = 300.0  # seconds
 
 app = FastAPI(title="CallGrid Acceptance Mediator")
+
+# ---------- helpers
 
 def area_code_from_phone(p: str) -> str:
     m = re.search(r"(\d{10})$", re.sub(r"\D", "", p or ""))
     return (m.group(1)[0:3] if m else "UNK")
 
 def route_key_from_json(base: str, counts: Dict[str, Any], phone: str) -> str:
-    """Prefer explicit state/vendor if TLD returns them; else fall back to ANI area code."""
     st = str(counts.get("state") or counts.get("st") or area_code_from_phone(phone))
     ing = str(counts.get("ingroup") or counts.get("vendor") or base)
     return f"{ing}|{st}"
 
-async def tld_ready(client: httpx.AsyncClient, phone: str, extra: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Call TLD Dialer Ready with your current flags; allow per-call overrides via `extra`.
-    Note: keys in `extra` override the defaults below.
-    """
-    base_params = {
-        "ava": 1,
-        "ing": ING_BASE,   # can be overridden by extra["ing"]
-        "sta": "true",
-        "cnt": "true",
-        "act": "true",
-        "pol": "true",
-        "rsn": "true",
-    }
-    params = {**base_params, **extra}
-    url = f"{TLD_BASE}/api/public/dialer/ready/{phone}"
-    r = await client.get(url, params=params)
-    r.raise_for_status()
-    return r.json()
-
-async def tld_agents_live(client: httpx.AsyncClient) -> Any:
-    """
-    Fetch per-agent live data. If your tenant uses a different route,
-    set AGENT_STATUS_PATH in the service env.
-    """
-    url = f"{TLD_BASE}{AGENT_STATUS_PATH}"
-    r = await client.get(url, timeout=HTTP_TIMEOUT)
-    r.raise_for_status()
-    data = r.json()
-    # normalize to a list of rows
+def normalize_rows(data: Any) -> List[Dict[str, Any]]:
     if isinstance(data, list):
-        return data
+        return [r for r in data if isinstance(r, dict)]
     if isinstance(data, dict):
-        for k in ("agents","data","rows"):
-            if isinstance(data.get(k), list):
-                return data[k]
-    # last resort: wrap dict
-    return [data]
+        for k in ("agents", "data", "rows"):
+            v = data.get(k)
+            if isinstance(v, list):
+                return [r for r in v if isinstance(r, dict)]
+    return []
 
-def parse_hhmmss_to_seconds(s: str) -> int | None:
-    if not isinstance(s, str):
+def parse_hhmmss_to_seconds(s: str) -> Optional[int]:
+    if s is None:
         return None
-    s = s.strip()
-    # H:MM:SS or MM:SS
-    m = re.match(r"^(?:(\d+):)?([0-5]?\d):([0-5]?\d)$", s)
+    s = str(s).strip()
+    m = re.match(r"^(?:(\d+):)?([0-5]?\d):([0-5]?\d)$", s)  # H:MM:SS or MM:SS
     if m:
         h = int(m.group(1) or 0); mm = int(m.group(2)); ss = int(m.group(3))
         return h*3600 + mm*60 + ss
@@ -79,18 +60,18 @@ def parse_hhmmss_to_seconds(s: str) -> int | None:
         return int(s)
     return None
 
-def pick(obj: dict, keys: list[str]) -> Any:
+def pick(obj: Dict[str, Any], keys: List[str]) -> Any:
     for k in keys:
         if k in obj:
             return obj[k]
-    # try case-insensitive
-    low = {str(k).lower(): v for k,v in obj.items()}
+    low = {str(k).lower(): v for k, v in obj.items()}
     for k in keys:
-        if k.lower() in low:
-            return low[k.lower()]
+        lk = k.lower()
+        if lk in low:
+            return low[lk]
     return None
 
-def match_ingroup_state(row: dict, ing_base: str, st: str | None) -> bool:
+def match_ingroup_state(row: Dict[str, Any], ing_base: str, st: Optional[str]) -> bool:
     """
     Accept if row's ingroup/campaign matches the requested ing_base (+ optional state).
     We check several likely column names seen in TLD UIs/APIs.
@@ -107,20 +88,87 @@ def match_ingroup_state(row: dict, ing_base: str, st: str | None) -> bool:
     if st:
         st_up = st.strip().upper()
         return val_up == f"{ing_up}{st_up}" or val_up.endswith(f" {st_up}")
-    # base only
     return val_up == ing_up or val_up.startswith(ing_up)
 
-def row_status(row: dict) -> str:
+def row_status(row: Dict[str, Any]) -> str:
     s = pick(row, ["Live Status","status","Status","agent status"]) or ""
     return str(s).strip().lower()
 
-def row_status_duration_seconds(row: dict) -> int | None:
+def row_status_duration_seconds(row: Dict[str, Any]) -> Optional[int]:
     dur = pick(row, ["Status Duration","status duration","duration","status_duration","live status duration"])
-    return parse_hhmmss_to_seconds(str(dur)) if dur is not None else None
+    return parse_hhmmss_to_seconds(dur)
+
+# ---------- TLD calls
+
+async def tld_ready(client: httpx.AsyncClient, phone: str, extra: Dict[str, Any]) -> Dict[str, Any]:
+    base_params = {
+        "ava": 1,
+        "ing": ING_BASE,   # may be overridden by extra["ing"]
+        "sta": "true",
+        "cnt": "true",
+        "act": "true",
+        "pol": "true",
+        "rsn": "true",
+    }
+    params = {**base_params, **extra}
+    url = f"{TLD_BASE}/api/public/dialer/ready/{phone}"
+    r = await client.get(url, params=params, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+async def discover_agents_endpoint(client: httpx.AsyncClient) -> str:
+    """Find a working per-agent live endpoint and cache it."""
+    global _agent_path_cache
+
+    # use cache if fresh
+    if _agent_path_cache and _agent_path_cache[1] > time.time():
+        return _agent_path_cache[0]
+
+    candidates = []
+    if ENV_AGENT_STATUS_PATH:
+        candidates.append(ENV_AGENT_STATUS_PATH)
+    candidates.extend([p for p in AGENT_ENDPOINT_CANDIDATES if p != ENV_AGENT_STATUS_PATH])
+
+    for path in candidates:
+        try:
+            url = f"{TLD_BASE}{path}"
+            r = await client.get(url, timeout=HTTP_TIMEOUT)
+            if r.status_code == 200:
+                rows = normalize_rows(r.json())
+                if rows is not None:  # even empty list is acceptable; shape is OK
+                    _agent_path_cache = (path, time.time() + AGENT_PATH_CACHE_TTL)
+                    return path
+        except httpx.HTTPError:
+            continue
+
+    raise HTTPException(status_code=502, detail={
+        "shouldAccept": False,
+        "error": "No per-agent Live endpoint found; set AGENT_STATUS_PATH env or contact TLD support."
+    })
+
+async def tld_agents_live(client: httpx.AsyncClient) -> Tuple[str, List[Dict[str, Any]]]:
+    """Return (path_used, agent_rows)."""
+    path = await discover_agents_endpoint(client)
+    url = f"{TLD_BASE}{path}"
+    r = await client.get(url, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    rows = normalize_rows(r.json())
+    return path, rows
+
+# ---------- Routes
 
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
+
+@app.get("/diag/agents-endpoints")
+async def diag_agents_endpoints():
+    """Quick diag: which endpoint is discovered right now."""
+    path = _agent_path_cache[0] if _agent_path_cache else None
+    return {
+        "current_path": path,
+        "candidates": ([ENV_AGENT_STATUS_PATH] if ENV_AGENT_STATUS_PATH else []) + AGENT_ENDPOINT_CANDIDATES
+    }
 
 @app.get("/accept")
 async def accept(
@@ -130,7 +178,6 @@ async def accept(
     threshold: Optional[int] = Query(None, description="Override IDLE_THRESHOLD (seconds)"),
     dry: Optional[int] = Query(0, description="If 1, never accept (for safe testing)"),
     # state selection
-    no_state: Optional[int] = Query(0, description="If 1, disable state suffix for counts (kept for completeness)"),
     state: Optional[str] = Query(None, description="Force a single state, e.g., FL"),
     states: Optional[str] = Query(None, description="CSV list of states, e.g., MI,TX,OK"),
     # debug
@@ -146,84 +193,76 @@ async def accept(
     IDLE_THRESHOLD_THIS = IDLE_THRESHOLD if threshold is None else int(threshold)
 
     # build state list
-    state_list: list[Optional[str]] = []
+    state_list: List[Optional[str]] = []
     if states:
         state_list = [s.strip().upper() for s in states.split(",") if s.strip()]
     elif state:
         state_list = [state.strip().upper()]
-    elif no_state:
-        state_list = [None]  # base ingroup only
     else:
-        state_list = [None]  # default (base) — you can pass state(s) explicitly in CallGrid
-
-    now = time.time()
+        state_list = [None]  # base only unless you pass states
 
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            # fetch agents once; we’ll filter locally
+            agents_path, agents_rows = await tld_agents_live(client)
 
-            # 1) get agents once (we filter client-side per state)
-            agents_rows = await tld_agents_live(client)
-
-            # 2) function to evaluate one state
-            async def eval_state(st: Optional[str]) -> dict:
-                # counts endpoint for "ready" (fast path for >= ready_min)
+            async def eval_state(st: Optional[str]) -> Dict[str, Any]:
+                # counts: fast path for "ready >= ready_min"
                 counts = await tld_ready(client, phone, extra={
                     "ing": f"{ING_THIS}{st}" if st else ING_THIS,
-                    "sta": "false" if st else "true"  # if state is forced, don't let TLD append another suffix
+                    "sta": "false" if st else "true"  # when state forced, don't let TLD append again
                 })
                 ready_count = int(counts.get("ready", counts.get("ava", 0)) or 0)
                 ready_ge_min = ready_count >= READY_MIN_THIS
 
-                # filter agent rows: ingroup (+state), status in {CLOSER, READY}
+                # from agent rows: only statuses closer/ready, compute max status duration
                 max_duration = 0
-                matched = []
+                matched: List[Dict[str, Any]] = []
                 for row in agents_rows:
                     try:
                         if not match_ingroup_state(row, ING_THIS, st):
                             continue
-                        st_lower = row_status(row)
-                        if st_lower not in READYLIKE_STATUSES:
+                        status_l = row_status(row)
+                        if status_l not in READYLIKE_STATUSES:
                             continue
                         dur = row_status_duration_seconds(row)
                         if dur is None:
                             continue
                         max_duration = max(max_duration, int(dur))
-                        matched.append({
-                            "status": st_lower,
-                            "duration": int(dur),
-                            "ingroupField": pick(row, ["Call Ingroup Name","ingroup","Call Campaign / Ingroup","Campaign / Ingroup","campaign","vendor"]),
-                            "agent": pick(row, ["Agent Full Name","User","user","agent"]),
-                        })
+                        if raw:
+                            matched.append({
+                                "status": status_l,
+                                "duration": int(dur),
+                                "ingroupField": pick(row, ["Call Ingroup Name","ingroup","Call Campaign / Ingroup",
+                                                           "Campaign / Ingroup","campaign","vendor"]),
+                                "agent": pick(row, ["Agent Full Name","User","user","agent"]),
+                            })
                     except Exception:
                         continue
 
-                # decision for this state
                 waiting_too_long = (max_duration >= IDLE_THRESHOLD_THIS) and (max_duration > 0)
-                candidate = bool(ready_ge_min or (waiting_too_long and len(matched) > 0))
-
-                dbg = {
-                    "ing": ING_THIS,
-                    "state": (st or "BASE"),
-                    "route_key": f"{ING_THIS}{st or ''}|{area_code_from_phone(phone)}",
-                    "ready": ready_count,
-                    "ready_min": READY_MIN_THIS,
-                    "threshold": IDLE_THRESHOLD_THIS,
-                    "max_agent_status_duration": max_duration,
-                    "matched_agents": matched[:10],  # cap for readability
-                }
-                if raw:
-                    dbg["counts_raw"] = counts
+                candidate = bool(ready_ge_min or (waiting_too_long and max_duration > 0))
 
                 return {
                     "candidate": candidate,
                     "ready": ready_count,
                     "maxStatusDuration": max_duration,
                     "waitingTooLong": waiting_too_long,
-                    "debug": dbg
+                    "debug": {
+                        "ing": ING_THIS,
+                        "state": (st or "BASE"),
+                        "route_key": f"{ING_THIS}{st or ''}|{area_code_from_phone(phone)}",
+                        "ready_min": READY_MIN_THIS,
+                        "threshold": IDLE_THRESHOLD_THIS,
+                        "ready_ge_min": ready_ge_min,
+                        "agents_endpoint": agents_path,
+                        **({"counts_raw": counts} if raw else {}),
+                        **({"matched_agents": matched[:10]} if raw else {}),
+                    }
                 }
 
-            # 3) evaluate all requested states
-            per_state: dict[str, dict] = {}
+            # Evaluate all requested states
+            per_state: Dict[str, Dict[str, Any]] = {}
             overall_ready = 0
             overall_waiting = False
             overall_candidate = False
@@ -245,7 +284,7 @@ async def accept(
                 "shouldAccept": should_accept,
                 "ready": overall_ready,
                 "waitingTooLong": overall_waiting,
-                "idleObservedSeconds": overall_maxdur,  # now reflects max agent Status Duration
+                "idleObservedSeconds": overall_maxdur,  # now = max agent Status Duration (sec)
                 "debug": {
                     "ing": ING_THIS,
                     "states_evaluated": list(per_state.keys()),
@@ -255,7 +294,10 @@ async def accept(
                 }
             }
             if raw:
-                resp["debug"]["agents_raw_sample"] = agents_rows[:10] if isinstance(agents_rows, list) else agents_rows
+                resp["debug"]["agents_endpoint_used"] = agents_path
+                # Include a small sample of raw rows to verify field names
+                resp["debug"]["agents_raw_sample"] = agents_rows[:10]
+
             return resp
 
     except httpx.HTTPError as e:
@@ -263,4 +305,3 @@ async def accept(
             "shouldAccept": False,
             "error": f"TLD call failed: {str(e)}"
         })
-
