@@ -79,30 +79,55 @@ def pick(obj: Dict[str, Any], keys: List[str]) -> Any:
     return None
 
 def match_ingroup_state(row: Dict[str, Any], ing_base: str, st: Optional[str]) -> bool:
+    """
+    Accept if row's ingroup/campaign matches the requested ing_base (+ optional state).
+    Supports both UI-ish keys and tldialer snake_case keys.
+    """
     ing_fields = [
+        # UI-ish:
         "ingroup", "call ingroup name", "call ingroup", "call campaign / ingroup",
-        "campaign / ingroup", "vendor", "campaign", "campaign name", "call_campaign_id"
+        "campaign / ingroup", "vendor", "campaign", "campaign name",
+        # tldialer snake_case:
+        "call_ingroup_group_name", "call_ingroup_name",
+        "call_campaign_id", "campaign_id"
     ]
     val = pick(row, ing_fields)
     if not val:
         return False
+
     val_up = str(val).strip().upper()
     ing_up = ing_base.strip().upper()
+
+    # If the field is a pure campaign_id (e.g. SREZMEDI_FL), it should
+    # already have the state suffix; just compare directly.
     if st:
         st_up = st.strip().upper()
-        return val_up == f"{ing_up}{st_up}" or val_up.endswith(f" {st_up}")
-    return val_up == ing_up or val_up.startswith(ing_up)
+        return (
+            val_up == f"{ing_up}{st_up}"      # exact “SREZMEDI_” + “FL”
+            or val_up.endswith(f" {st_up}")   # “… FL”
+            or val_up.endswith(f"_{st_up}")   # “…_FL”
+        )
+    # base only
+    return (
+        val_up == ing_up
+        or val_up.startswith(ing_up)
+    )
+
 
 def row_status(row: Dict[str, Any]) -> str:
-    s = pick(row, ["Live Status","status","Status","agent status","live_status"]) or ""
+    # Add snake_case live_status
+    s = pick(row, ["Live Status", "live_status", "status", "Status", "agent status"]) or ""
     return str(s).strip().lower()
 
+
 def row_status_duration_seconds(row: Dict[str, Any]) -> Optional[int]:
+    # Add snake_case last_state_duration
     dur = pick(row, [
-        "Status Duration","status duration","duration","status_duration",
-        "live status duration","last_state_duration"
+        "Status Duration", "status duration", "duration", "status_duration",
+        "live status duration", "Last State Duration", "last_state_duration"
     ])
     return parse_hhmmss_to_seconds(dur)
+
 
 def auth_headers_for(path: str) -> Dict[str, str]:
     """
@@ -244,9 +269,12 @@ async def accept(
                                 matched.append({
                                     "status": status_l,
                                     "duration": int(dur),
-                                    "ingroupField": pick(row, ["Call Ingroup Name","ingroup","Call Campaign / Ingroup",
-                                                               "Campaign / Ingroup","campaign","vendor","call_campaign_id"]),
-                                    "agent": pick(row, ["Agent Full Name","User","user","agent","agent_full_name"]),
+                                    "ingroupField": pick(row, [
+                                        "Call Ingroup Name","ingroup","Call Campaign / Ingroup","Campaign / Ingroup",
+                                        "campaign","vendor","call_ingroup_group_name","call_campaign_id","campaign_id"
+                                    ]),
+                                    "agent": pick(row, ["Agent Full Name","agent_full_name","User","user","agent"]),
+
                                 })
                         except Exception:
                             continue
