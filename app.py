@@ -79,28 +79,39 @@ def pick(obj: Dict[str, Any], keys: List[str]) -> Any:
     return None
 
 def match_ingroup_state(row: Dict[str, Any], ing_base: str, st: Optional[str]) -> bool:
-    ing_fields = [
-        # vicidial_live_agents:
-        "call_campaign_id",           # e.g. SREZMEDI_FL
-        "call_ingroup_group_name",    # e.g. SR EZMed Inbound  FL
-
-        # UI/other payloads we already tried:
-        "ingroup", "call ingroup name", "call ingroup", "call campaign / ingroup",
-        "campaign / ingroup", "vendor", "campaign", "campaign name"
-    ]
-    val = pick(row, ing_fields)
-    if not val:
-        return False
-
-    val_up = str(val).strip().upper()
+    """
+    Accept if the row is in the requested ing_base (+ optional state).
+    We intentionally check BOTH the in-group name and the coded id.
+    """
     ing_up = ing_base.strip().upper()
+    st_up  = st.strip().upper() if st else None
 
-    if st:
-        st_up = st.strip().upper()
-        # exact coded id (SREZMEDI_FL) OR human label that ends with " FL"
-        return (val_up == f"{ing_up}{st_up}") or val_up.endswith(f" {st_up}")
-    # base only
-    return val_up == ing_up or val_up.startswith(ing_up)
+    # Prefer the human in-group label when present, e.g. "SR EZMed Inbound  FL"
+    ingroup_label = pick(row, [
+        "call_ingroup_group_name",  # vicidial_live_agents
+        "Call Ingroup Name", "call ingroup name", "call ingroup",
+        "Campaign / Ingroup", "call campaign / ingroup"
+    ])
+    # Also check the coded id when present, e.g. "SREZMEDI_FL"
+    coded_id = pick(row, [
+        "call_campaign_id",         # vicidial_live_agents: often EZSALES or SREZMEDI_FL
+        "vendor", "ingroup", "campaign", "campaign name"
+    ])
+
+    # Normalize
+    label = str(ingroup_label or "").strip().upper()
+    code  = str(coded_id or "").strip().upper()
+
+    if st_up:
+        # Match either the coded id "SREZMEDI_FL" OR a label that ends with " FL"
+        ok_label = bool(label and label.endswith(f" {st_up}"))
+        ok_code  = (code == f"{ing_up}{st_up}")
+        return ok_label or ok_code
+    else:
+        # Base only: allow exact id or prefix on code OR a label starting with our base
+        ok_label = bool(label and label.startswith(ing_up))
+        ok_code  = (code == ing_up or code.startswith(ing_up))
+        return ok_label or ok_code
 
 
 def row_status(row: Dict[str, Any]) -> str:
