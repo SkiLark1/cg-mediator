@@ -57,7 +57,9 @@ async def accept(
     threshold: Optional[int] = Query(None, description="Override IDLE_THRESHOLD (seconds)"),
     dry: Optional[int] = Query(0, description="If 1, never accept (for safe testing)"),
     no_state: Optional[int] = Query(0, description="If 1, disable state suffix (sta=false)"),
-    state: Optional[str] = Query(None, description="Force a specific state suffix, e.g., FL")
+    state: Optional[str] = Query(None, description="Force a specific state suffix, e.g., FL"),
+    scope: Optional[str] = Query("ing", description="Idle scope: ing | sta | all"),
+    raw: Optional[int] = Query(0, description="If 1, include raw upstream JSON for debugging")
 ):
     now = time.time()
 
@@ -70,22 +72,34 @@ async def accept(
     force_state = (state or "").strip().upper() or None
     use_sta_flag = False if no_state else True  # default True unless no_state=1
 
+    # Normalize scope
+    scope = (scope or "ing").lower()
+    if scope not in ("ing", "sta", "all"):
+        scope = "ing"
+
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
             # Helper to call with a given state strategy
             async def get_counts_and_idle(sta_flag: bool, forced_state: Optional[str]):
-                # If forcing a state, use ing+STATE and sta=false (so TLD doesn't append again)
+                # Build params for counts
                 if forced_state:
                     counts_params = {"ing": f"{ING_THIS}{forced_state}", "sta": "false"}
-                    idle_params   = {"ing": f"{ING_THIS}{forced_state}", "sta": "false", "que": 0, "qui": "ing", "ava": 1}
-                    state_mode = forced_state
                 else:
                     counts_params = {"ing": ING_THIS, "sta": "true" if sta_flag else "false"}
-                    idle_params   = {"ing": ING_THIS, "sta": "true" if sta_flag else "false", "que": 0, "qui": "ing", "ava": 1}
-                    state_mode = "AUTO" if sta_flag else "NONE"
 
                 counts_resp = await tld_ready(client, phone, extra=counts_params)
-                idle_resp   = await tld_ready(client, phone, extra=idle_params)
+
+                # Build params for idle probe
+                idle_params = counts_params.copy()
+                idle_params.update({"ava": 1, "que": 0})
+                if scope in ("ing", "sta"):
+                    idle_params["qui"] = scope  # qui=ing or qui=sta
+                # if scope=all -> don't send qui, just que=0
+
+                idle_resp = await tld_ready(client, phone, extra=idle_params)
+
+                # Label mode
+                state_mode = forced_state or ("AUTO" if sta_flag else "NONE")
                 return counts_resp, idle_resp, state_mode
 
             # 1) First try with selected strategy (forced-state > no_state > auto)
@@ -112,7 +126,6 @@ async def accept(
                 idle_now = str(idle_resp.get("val", "0")).lower() in ("1", "true")
 
             # Build route key using what we actually queried
-            # If we forced a state, embed it in the ing used for the key.
             effective_ing_for_key = f"{ING_THIS}{force_state}" if force_state else ING_THIS
             rk = route_key_from_json(effective_ing_for_key, counts, phone)
 
@@ -127,7 +140,7 @@ async def accept(
             computed_should_accept = bool(ready_ge_min or waiting_too_long)
             should_accept = False if dry else computed_should_accept  # dry-run forces false
 
-            return {
+            resp = {
                 "shouldAccept": should_accept,
                 "ready": ready_count,
                 "waitingTooLong": waiting_too_long,
@@ -141,10 +154,18 @@ async def accept(
                     "route_key": rk,
                     "state_mode": state_mode,         # "AUTO", "NONE", or forced state like "FL"
                     "fallback_used": fallback_used,   # True if we retried with sta=false
+                    "scope": scope,
                     "computed_should_accept": computed_should_accept,
                     "dry_mode": bool(dry),
                 }
             }
+
+            if raw:
+                # include raw upstream for diagnosis (trim very large payloads if needed)
+                resp["debug"]["counts_raw"] = counts
+                resp["debug"]["idle_raw"] = idle_resp
+
+            return resp
 
     except httpx.HTTPError as e:
         # Explicitly reject on dependency failure
