@@ -7,7 +7,7 @@ import httpx
 TLD_BASE       = os.getenv("TLD_BASE", "https://5star.tldcrm.com")
 ING_BASE       = os.getenv("ING_BASE", "SRMEDTI_")          # default ingroup base
 READY_MIN      = int(os.getenv("READY_MIN", "2"))           # "more than 1 agent"
-IDLE_THRESHOLD = int(os.getenv("IDLE_THRESHOLD", "30"))     # seconds
+IDLE_THRESHOLD = int(os.getenv("IDLE_THRESHOLD", "60"))     # seconds
 HTTP_TIMEOUT   = float(os.getenv("HTTP_TIMEOUT", "2.0"))
 
 # Track when (ava>=1 & queue==0) started, per key
@@ -56,127 +56,162 @@ async def accept(
     ready_min: Optional[int] = Query(None, description="Override READY_MIN"),
     threshold: Optional[int] = Query(None, description="Override IDLE_THRESHOLD (seconds)"),
     dry: Optional[int] = Query(0, description="If 1, never accept (for safe testing)"),
+    # single-state controls (still supported)
     no_state: Optional[int] = Query(0, description="If 1, disable state suffix (sta=false)"),
     state: Optional[str] = Query(None, description="Force a specific state suffix, e.g., FL"),
+    # NEW: multi-state
+    states: Optional[str] = Query(None, description="Comma-separated state list, e.g., MI,TX,OK"),
     scope: Optional[str] = Query("ing", description="Idle scope: ing | sta | all"),
     raw: Optional[int] = Query(0, description="If 1, include raw upstream JSON for debugging")
 ):
     now = time.time()
 
-    # Per-call overrides (fall back to env defaults)
     ING_THIS = (ing or ING_BASE).strip()
     READY_MIN_THIS = READY_MIN if ready_min is None else int(ready_min)
     IDLE_THRESHOLD_THIS = IDLE_THRESHOLD if threshold is None else int(threshold)
 
-    # Decide state behavior
-    force_state = (state or "").strip().upper() or None
-    use_sta_flag = False if no_state else True  # default True unless no_state=1
-
-    # Normalize scope
+    # normalize scope
     scope = (scope or "ing").lower()
     if scope not in ("ing", "sta", "all"):
         scope = "ing"
 
+    # decide which state modes to evaluate
+    state_list = []
+    if states:
+        state_list = [s.strip().upper() for s in states.split(",") if s.strip()]
+    elif state:
+        state_list = [state.strip().upper()]
+    elif no_state:
+        state_list = [None]  # explicit base ingroup only
+    else:
+        # default “AUTO then fallback NONE” behavior as a single path
+        state_list = [None]  # we’ll still do AUTO vs NONE inside
+
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            # Helper to call with a given state strategy
-            async def get_counts_and_idle(sta_flag: bool, forced_state: Optional[str]):
-                # Build params for counts
-                if forced_state:
-                    counts_params = {"ing": f"{ING_THIS}{forced_state}", "sta": "false"}
-                else:
-                    counts_params = {"ing": ING_THIS, "sta": "true" if sta_flag else "false"}
 
-                counts_resp = await tld_ready(client, phone, extra=counts_params)
+            async def check_one_state(forced_state: Optional[str]):
+                """
+                Returns dict with: ready, idle_now, idle_age, waiting_too_long, should_accept_candidate, debug
+                Uses AUTO (sta=true) with fallback to sta=false when forced_state is None.
+                """
+                # --- inner helper to fetch counts/idle under a given sta flag and/or forced state
+                async def fetch(sta_flag: bool, forced: Optional[str]):
+                    if forced:
+                        counts_params = {"ing": f"{ING_THIS}{forced}", "sta": "false"}
+                        idle_params   = {"ing": f"{ING_THIS}{forced}", "sta": "false", "ava": 1, "que": 0}
+                    else:
+                        counts_params = {"ing": ING_THIS, "sta": "true" if sta_flag else "false"}
+                        idle_params   = {"ing": ING_THIS, "sta": "true" if sta_flag else "false", "ava": 1, "que": 0}
+                    if scope in ("ing", "sta"):
+                        idle_params["qui"] = scope
+                    counts_resp = await tld_ready(client, phone, extra=counts_params)
+                    idle_resp   = await tld_ready(client, phone, extra=idle_params)
+                    return counts_resp, idle_resp
 
-                # Build params for idle probe
-                idle_params = counts_params.copy()
-                idle_params.update({"ava": 1, "que": 0})
-                if scope in ("ing", "sta"):
-                    idle_params["qui"] = scope  # qui=ing or qui=sta
-                # if scope=all -> don't send qui, just que=0
-
-                idle_resp = await tld_ready(client, phone, extra=idle_params)
-
-                # Label mode
-                state_mode = forced_state or ("AUTO" if sta_flag else "NONE")
-                return counts_resp, idle_resp, state_mode
-
-            # 1) First try with selected strategy (forced-state > no_state > auto)
-            counts, idle_resp, state_mode = await get_counts_and_idle(use_sta_flag, force_state)
-            ready_count = int(counts.get("ready", counts.get("ava", 0)) or 0)
-
-            # 2) If auto (sta=true) yielded 0 ready and we didn't force state, fallback once with sta=false
-            fallback_used = False
-            if ready_count == 0 and force_state is None and use_sta_flag:
-                counts, idle_resp, state_mode = await get_counts_and_idle(False, None)
+                # 1) initial attempt
+                sta_auto = (forced_state is None)
+                counts, idle_resp = await fetch(sta_flag=sta_auto, forced=forced_state)
                 ready_count = int(counts.get("ready", counts.get("ava", 0)) or 0)
-                fallback_used = True
+                state_mode = forced_state or ("AUTO" if sta_auto else "NONE")
+                fallback_used = False
 
-            ready_ge_min = ready_count >= READY_MIN_THIS
+                # 2) fallback if AUTO returned 0
+                if sta_auto and ready_count == 0:
+                    counts, idle_resp = await fetch(sta_flag=False, forced=None)
+                    ready_count = int(counts.get("ready", counts.get("ava", 0)) or 0)
+                    state_mode = "NONE"
+                    fallback_used = True
 
-            # Detect idle_now robustly
-            idle_now = False
+                ready_ge_min = ready_count >= READY_MIN_THIS
 
-            # Try explicit flags first (works for some tenants)
-            if isinstance(idle_resp, dict):
-                if "queue" in idle_resp:
-                    try:
-                        idle_now = int(idle_resp["queue"]) == 0 and int(idle_resp.get("ready", 0)) >= 1
-                    except Exception:
-                        idle_now = False
+                # Detect “idle candidate”
+                idle_now = False
+                if isinstance(idle_resp, dict):
+                    if "queue" in idle_resp:
+                        try:
+                            idle_now = int(idle_resp["queue"]) == 0 and int(idle_resp.get("ready", 0)) >= 1
+                        except Exception:
+                            idle_now = False
+                    if not idle_now:
+                        idle_now = str(idle_resp.get("val", "0")).lower() in ("1", "true")
                 if not idle_now:
-                    idle_now = str(idle_resp.get("val", "0")).lower() in ("1", "true")
+                    idle_now = (ready_count >= 1 and not ready_ge_min)
 
-            # Fallback (your tenant): if at least one is ready but below the min,
-            # consider that our "idle candidate" to time.
-            if not idle_now:
-                idle_now = (ready_count >= 1 and not ready_ge_min)
+                # route-key for timing (include forced state if present)
+                effective_ing = f"{ING_THIS}{forced_state}" if forced_state else ING_THIS
+                rk = route_key_from_json(effective_ing, counts, phone)
 
-            # Build route key using what we actually queried
-            effective_ing_for_key = f"{ING_THIS}{force_state}" if force_state else ING_THIS
-            rk = route_key_from_json(effective_ing_for_key, counts, phone)
+                # update timer
+                if idle_now:
+                    idle_since.setdefault(rk, now)
+                else:
+                    idle_since.pop(rk, None)
+                idle_age = int(now - idle_since[rk]) if rk in idle_since else 0
+                waiting_too_long = idle_age >= IDLE_THRESHOLD_THIS
 
-            if idle_now:
-                idle_since.setdefault(rk, now)
-            else:
-                idle_since.pop(rk, None)
+                # candidate accept for this state
+                candidate_accept = bool(ready_ge_min or waiting_too_long)
 
-            idle_age = int(now - idle_since[rk]) if rk in idle_since else 0
-            waiting_too_long = idle_age >= IDLE_THRESHOLD_THIS
-
-            computed_should_accept = bool(ready_ge_min or waiting_too_long)
-            should_accept = False if dry else computed_should_accept  # dry-run forces false
-
-            resp = {
-                "shouldAccept": should_accept,
-                "ready": ready_count,
-                "waitingTooLong": waiting_too_long,
-                "idleObservedSeconds": idle_age,
-                "debug": {
+                dbg = {
                     "ing": ING_THIS,
+                    "state_mode": state_mode if forced_state else state_mode,
+                    "route_key": rk,
                     "ready_min": READY_MIN_THIS,
                     "threshold": IDLE_THRESHOLD_THIS,
                     "ready_ge_min": ready_ge_min,
                     "idle_now": idle_now,
-                    "route_key": rk,
-                    "state_mode": state_mode,         # "AUTO", "NONE", or forced state like "FL"
-                    "fallback_used": fallback_used,   # True if we retried with sta=false
+                    "fallback_used": fallback_used,
                     "scope": scope,
+                }
+                if raw:
+                    dbg["counts_raw"] = counts
+                    dbg["idle_raw"] = idle_resp
+
+                return {
+                    "ready": ready_count,
+                    "idleObservedSeconds": idle_age,
+                    "waitingTooLong": waiting_too_long,
+                    "candidate": candidate_accept,
+                    "debug": dbg
+                }
+
+            # Evaluate one or many states
+            per_state = {}
+            overall_ready = 0
+            overall_waiting = False
+            overall_idle_age = 0
+            overall_candidate = False
+
+            for st in state_list:
+                res = await check_one_state(st)
+                label = (st or "BASE")
+                per_state[label] = res
+                overall_ready = max(overall_ready, res["ready"])
+                overall_waiting = overall_waiting or res["waitingTooLong"]
+                overall_idle_age = max(overall_idle_age, res["idleObservedSeconds"])
+                overall_candidate = overall_candidate or res["candidate"]
+
+            # If we only evaluated BASE (no states), the above loop still handled AUTO->NONE fallback inside.
+
+            computed_should_accept = overall_candidate
+            should_accept = False if dry else computed_should_accept
+
+            return {
+                "shouldAccept": should_accept,
+                "ready": overall_ready,
+                "waitingTooLong": overall_waiting,
+                "idleObservedSeconds": overall_idle_age,
+                "debug": {
+                    "ing": ING_THIS,
+                    "states_evaluated": list(per_state.keys()),
+                    "per_state": per_state,
                     "computed_should_accept": computed_should_accept,
                     "dry_mode": bool(dry),
                 }
             }
 
-            if raw:
-                # include raw upstream for diagnosis (trim very large payloads if needed)
-                resp["debug"]["counts_raw"] = counts
-                resp["debug"]["idle_raw"] = idle_resp
-
-            return resp
-
     except httpx.HTTPError as e:
-        # Explicitly reject on dependency failure
         raise HTTPException(status_code=502, detail={
             "shouldAccept": False,
             "error": f"TLD call failed: {str(e)}"
