@@ -46,6 +46,7 @@ AGENT_PATH_CACHE_TTL = 300.0  # seconds
 
 # Counts/idle fallback state
 idle_since: Dict[str, float] = {}
+ready_since: Dict[str, float] = {}
 
 app = FastAPI(title="CallGrid Acceptance Mediator")
 
@@ -314,7 +315,7 @@ async def accept(
             agents_path = await discover_agents_endpoint(client)  # may be None
 
             async def eval_state(st: Optional[str]) -> Dict[str, Any]:
-                # ---- 1) COUNTS/IDLE: always compute
+                # ---- 1) COUNTS: always compute
                 counts = await tld_ready(client, phone, extra={
                     "ing": f"{ING_THIS}{st}" if st else ING_THIS,
                     "sta": "false" if st else "true"
@@ -322,7 +323,7 @@ async def accept(
                 ready_count = int(counts.get("ready", counts.get("ava", 0)) or 0)
                 ready_ge_min = ready_count >= READY_MIN_THIS
 
-                # probe idle now?
+                # probe idle now? (queue==0 & ready>=1)
                 idle_probe = await tld_ready(client, phone, extra={
                     "ing": f"{ING_THIS}{st}" if st else ING_THIS,
                     "que": 0, "qui": "ing", "ava": 1, "sta": "false" if st else "true"
@@ -338,18 +339,27 @@ async def accept(
 
                 rk = route_key(ING_THIS, st, phone)
                 now = time.time()
+
+                # idle timer
                 if idle_now:
                     idle_since.setdefault(rk, now)
                 else:
                     idle_since.pop(rk, None)
                 idle_age = int(now - idle_since[rk]) if rk in idle_since else 0
 
-                # these are our baseline values
-                effective_max_secs = idle_age
+                # NEW: ready timer — as long as at least 1 agent is READY in this ingroup+state
+                if ready_count >= 1:
+                    ready_since.setdefault(rk, now)
+                else:
+                    ready_since.pop(rk, None)
+                ready_age = int(now - ready_since[rk]) if rk in ready_since else 0
+
+                # baseline effective duration from counts: max of idle & ready ages
+                effective_max_secs = max(idle_age, ready_age)
                 source_mode = "counts_fallback"
                 matched: List[Dict[str, Any]] = []
 
-                # ---- 2) AGENTS: overlay if we actually see READY/CLOSER
+                # ---- 2) AGENTS overlay (if it actually shows READY/CLOSER)
                 if agents_path:
                     try:
                         rows = await tld_agents_live(client, agents_path)
@@ -379,8 +389,7 @@ async def accept(
                             effective_max_secs = max_ready_secs
                             source_mode = "agents"
                     except Exception:
-                        # ignore agent fetch errors and stick with counts
-                        pass
+                        pass  # keep counts result
 
                 waiting_too_long = effective_max_secs >= IDLE_THRESHOLD_THIS
                 candidate = bool(ready_ge_min or waiting_too_long)
@@ -393,11 +402,15 @@ async def accept(
                     "ready_min": READY_MIN_THIS,
                     "threshold": IDLE_THRESHOLD_THIS,
                     "ready_ge_min": ready_ge_min,
+                    "ready_count": ready_count,
+                    "idle_now": idle_now,
+                    "idle_age": idle_age,
+                    "ready_age": ready_age,
                     "campaign_fallback": bool(ALLOW_CAMPAIGN_FALLBACK),
                 }
-                if agents_path and raw:
+                if agents_path:
                     dbg["agents_endpoint"] = agents_path
-                    if matched:
+                    if raw and matched:
                         dbg["matched_agents"] = matched[:10]
                 if raw:
                     dbg["counts_raw"] = counts
@@ -411,7 +424,7 @@ async def accept(
                     "debug": dbg
                 }
 
-            # evaluate requested states
+            # evaluate states
             per_state: Dict[str, Dict[str, Any]] = {}
             overall_ready = 0
             overall_waiting = False
