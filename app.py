@@ -184,6 +184,61 @@ async def tld_ready(client: httpx.AsyncClient, phone: str, extra: Dict[str, Any]
     r.raise_for_status()
     return r.json()
 
+async def counts_fallback_eval(st: Optional[str], counts: Dict[str, Any],
+                               client: httpx.AsyncClient, ING_THIS: str,
+                               READY_MIN_THIS: int, IDLE_THRESHOLD_THIS: int,
+                               phone: str, raw: int) -> Dict[str, Any]:
+    # Probe "idle now?" (queue==0 & ready>=1) for this ing+state
+    idle_resp = await tld_ready(client, phone, extra={
+        "ing": f"{ING_THIS}{st}" if st else ING_THIS,
+        "que": 0, "qui": "ing", "ava": 1, "sta": "false" if st else "true"
+    })
+
+    idle_now = False
+    if "queue" in idle_resp:
+        try:
+            idle_now = int(idle_resp["queue"]) == 0 and int(idle_resp.get("ready", 0)) >= 1
+        except Exception:
+            idle_now = False
+    if not idle_now:
+        idle_now = str(idle_resp.get("val", "0")).lower() in ("1", "true")
+
+    rk = route_key(ING_THIS, st, phone)
+    now = time.time()
+    if idle_now:
+        idle_since.setdefault(rk, now)
+    else:
+        idle_since.pop(rk, None)
+    idle_age = int(now - idle_since[rk]) if rk in idle_since else 0
+
+    ready_count = int(counts.get("ready", counts.get("ava", 0)) or 0)
+    ready_ge_min = ready_count >= READY_MIN_THIS
+    waiting_too_long = idle_age >= IDLE_THRESHOLD_THIS
+    candidate = bool(ready_ge_min or waiting_too_long)
+
+    dbg = {
+        "mode": "counts_fallback",
+        "ing": ING_THIS,
+        "state": (st or "BASE"),
+        "route_key": rk,
+        "ready_min": READY_MIN_THIS,
+        "threshold": IDLE_THRESHOLD_THIS,
+        "ready_ge_min": ready_ge_min,
+        "idle_now": idle_now,
+    }
+    if raw:
+        dbg["idle_probe_raw"] = idle_resp
+        dbg["counts_raw"] = counts
+
+    return {
+        "candidate": candidate,
+        "ready": ready_count,
+        "maxStatusDuration": idle_age,  # we expose the observed idle seconds here
+        "waitingTooLong": waiting_too_long,
+        "debug": dbg
+    }
+
+
 async def discover_agents_endpoint(client: httpx.AsyncClient) -> Optional[str]:
     global _agent_path_cache
     if _agent_path_cache and _agent_path_cache[1] > time.time():
@@ -361,6 +416,13 @@ async def accept(
                         return await counts_fallback_eval(st, counts)
 
                     waiting_too_long = (max_duration >= IDLE_THRESHOLD_THIS) and (max_duration > 0)
+
+                    if max_duration == 0:
+                        # No READY/CLOSER visible → use counts-based idle timer
+                        return await counts_fallback_eval(
+                            st, counts, client, ING_THIS, READY_MIN_THIS, IDLE_THRESHOLD_THIS, phone, raw
+                        )
+
                     candidate = bool(ready_ge_min or waiting_too_long)
 
                     dbg = {
