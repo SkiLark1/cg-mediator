@@ -297,12 +297,6 @@ async def accept(
     states: Optional[str] = Query(None, description="CSV states (e.g., MI,TX,OK)"),
     raw: Optional[int] = Query(0, description="If 1, include raw debug")
 ):
-    """
-    Accept if:
-      - ready_count >= ready_min
-      - OR (agents mode): any agent with status in {CLOSER, READY} has StatusDuration >= threshold
-      - OR (counts fallback): ava>=1 & queue==0 for ing+state for >= threshold seconds
-    """
     ING_THIS = (ing or ING_BASE).strip()
     READY_MIN_THIS = READY_MIN if ready_min is None else int(ready_min)
     IDLE_THRESHOLD_THIS = IDLE_THRESHOLD if threshold is None else int(threshold)
@@ -317,11 +311,10 @@ async def accept(
 
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            agents_path = await discover_agents_endpoint(client)
-            mode = "agents" if agents_path else "counts_fallback"
+            agents_path = await discover_agents_endpoint(client)  # may be None
 
             async def eval_state(st: Optional[str]) -> Dict[str, Any]:
-                # 1) counts (always computed)
+                # ---- 1) COUNTS/IDLE: always compute
                 counts = await tld_ready(client, phone, extra={
                     "ing": f"{ING_THIS}{st}" if st else ING_THIS,
                     "sta": "false" if st else "true"
@@ -329,14 +322,39 @@ async def accept(
                 ready_count = int(counts.get("ready", counts.get("ava", 0)) or 0)
                 ready_ge_min = ready_count >= READY_MIN_THIS
 
-                if agents_path:
-                    # 2) duration via live agents
-                    rows = await tld_agents_live(client, agents_path)
-                    max_duration = 0
-                    matched: List[Dict[str, Any]] = []
+                # probe idle now?
+                idle_probe = await tld_ready(client, phone, extra={
+                    "ing": f"{ING_THIS}{st}" if st else ING_THIS,
+                    "que": 0, "qui": "ing", "ava": 1, "sta": "false" if st else "true"
+                })
+                idle_now = False
+                if "queue" in idle_probe:
+                    try:
+                        idle_now = int(idle_probe["queue"]) == 0 and int(idle_probe.get("ready", 0)) >= 1
+                    except Exception:
+                        idle_now = False
+                if not idle_now:
+                    idle_now = str(idle_probe.get("val", "0")).lower() in ("1", "true")
 
-                    for row in rows:
-                        try:
+                rk = route_key(ING_THIS, st, phone)
+                now = time.time()
+                if idle_now:
+                    idle_since.setdefault(rk, now)
+                else:
+                    idle_since.pop(rk, None)
+                idle_age = int(now - idle_since[rk]) if rk in idle_since else 0
+
+                # these are our baseline values
+                effective_max_secs = idle_age
+                source_mode = "counts_fallback"
+                matched: List[Dict[str, Any]] = []
+
+                # ---- 2) AGENTS: overlay if we actually see READY/CLOSER
+                if agents_path:
+                    try:
+                        rows = await tld_agents_live(client, agents_path)
+                        max_ready_secs = 0
+                        for row in rows:
                             status_l = row_status(row)
                             if status_l not in READYLIKE_STATUSES:
                                 continue
@@ -346,57 +364,54 @@ async def accept(
                             if dur is None:
                                 continue
                             d = int(dur)
-                            if d > max_duration:
-                                max_duration = d
+                            if d > max_ready_secs:
+                                max_ready_secs = d
                             if raw:
                                 matched.append({
                                     "status": status_l,
                                     "duration": d,
-                                    "agent": pick(row, ["agent_full_name", "Agent Full Name", "User", "user", "agent"]),
+                                    "agent": pick(row, ["agent_full_name","Agent Full Name","User","user","agent"]),
                                     "campaign": pick(row, ["campaign_id"]),
                                     "call_campaign_id": pick(row, ["call_campaign_id"]),
                                     "call_ingroup_group_name": pick(row, ["call_ingroup_group_name"]),
                                 })
-                        except Exception:
-                            continue
+                        if max_ready_secs > 0:
+                            effective_max_secs = max_ready_secs
+                            source_mode = "agents"
+                    except Exception:
+                        # ignore agent fetch errors and stick with counts
+                        pass
 
-                    # If the feed shows no READY/CLOSER rows at all, force counts/idle fallback.
-                    if max_duration == 0:
-                        return await counts_fallback_eval(
-                            st, counts, client, ING_THIS, READY_MIN_THIS, IDLE_THRESHOLD_THIS, phone, int(raw or 0)
-                        )
+                waiting_too_long = effective_max_secs >= IDLE_THRESHOLD_THIS
+                candidate = bool(ready_ge_min or waiting_too_long)
 
-                    waiting_too_long = (max_duration >= IDLE_THRESHOLD_THIS)
-                    candidate = bool(ready_ge_min or waiting_too_long)
-
-                    dbg = {
-                        "mode": mode,
-                        "ing": ING_THIS,
-                        "state": (st or "BASE"),
-                        "route_key": route_key(ING_THIS, st, phone),
-                        "ready_min": READY_MIN_THIS,
-                        "threshold": IDLE_THRESHOLD_THIS,
-                        "ready_ge_min": ready_ge_min,
-                        "agents_endpoint": agents_path,
-                        "campaign_fallback": bool(ALLOW_CAMPAIGN_FALLBACK),
-                    }
-                    if raw:
+                dbg = {
+                    "mode": source_mode,
+                    "ing": ING_THIS,
+                    "state": (st or "BASE"),
+                    "route_key": rk,
+                    "ready_min": READY_MIN_THIS,
+                    "threshold": IDLE_THRESHOLD_THIS,
+                    "ready_ge_min": ready_ge_min,
+                    "campaign_fallback": bool(ALLOW_CAMPAIGN_FALLBACK),
+                }
+                if agents_path and raw:
+                    dbg["agents_endpoint"] = agents_path
+                    if matched:
                         dbg["matched_agents"] = matched[:10]
-                        dbg["counts_raw"] = counts
-                    return {
-                        "candidate": candidate,
-                        "ready": ready_count,
-                        "maxStatusDuration": max_duration,
-                        "waitingTooLong": waiting_too_long,
-                        "debug": dbg
-                    }
+                if raw:
+                    dbg["counts_raw"] = counts
+                    dbg["idle_probe_raw"] = idle_probe
 
-                # 3) counts-based idle fallback (when no live-agents endpoint available at all)
-                return await counts_fallback_eval(
-                    st, counts, client, ING_THIS, READY_MIN_THIS, IDLE_THRESHOLD_THIS, phone, int(raw or 0)
-                )
+                return {
+                    "candidate": candidate,
+                    "ready": ready_count,
+                    "maxStatusDuration": effective_max_secs,
+                    "waitingTooLong": waiting_too_long,
+                    "debug": dbg
+                }
 
-            # Evaluate states
+            # evaluate requested states
             per_state: Dict[str, Dict[str, Any]] = {}
             overall_ready = 0
             overall_waiting = False
@@ -421,7 +436,7 @@ async def accept(
                 "waitingTooLong": overall_waiting,
                 "idleObservedSeconds": overall_maxdur,
                 "debug": {
-                    "ing": (ing or ING_BASE).strip(),
+                    "ing": ING_THIS,
                     "states_evaluated": list(per_state.keys()),
                     "per_state": per_state,
                     "computed_should_accept": computed_should_accept,
@@ -437,3 +452,4 @@ async def accept(
             "shouldAccept": False,
             "error": f"TLD call failed: {str(e)}"
         })
+
