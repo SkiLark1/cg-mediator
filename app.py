@@ -233,11 +233,10 @@ async def counts_fallback_eval(st: Optional[str], counts: Dict[str, Any],
     return {
         "candidate": candidate,
         "ready": ready_count,
-        "maxStatusDuration": idle_age,  # we expose the observed idle seconds here
+        "maxStatusDuration": idle_age,  # observed idle seconds
         "waitingTooLong": waiting_too_long,
         "debug": dbg
     }
-
 
 async def discover_agents_endpoint(client: httpx.AsyncClient) -> Optional[str]:
     global _agent_path_cache
@@ -321,56 +320,6 @@ async def accept(
             agents_path = await discover_agents_endpoint(client)
             mode = "agents" if agents_path else "counts_fallback"
 
-            # --- helper: counts/idle evaluation (used for pure fallback and forced-fallback)
-            async def counts_fallback_eval(st: Optional[str], counts: Dict[str, Any]) -> Dict[str, Any]:
-                idle_resp = await tld_ready(client, phone, extra={
-                    "ing": f"{ING_THIS}{st}" if st else ING_THIS,
-                    "que": 0, "qui": "ing", "ava": 1, "sta": "false" if st else "true"
-                })
-
-                idle_now = False
-                if "queue" in idle_resp:
-                    try:
-                        idle_now = int(idle_resp["queue"]) == 0 and int(idle_resp.get("ready", 0)) >= 1
-                    except Exception:
-                        idle_now = False
-                if not idle_now:
-                    idle_now = str(idle_resp.get("val", "0")).lower() in ("1", "true")
-
-                rk = route_key(ING_THIS, st, phone)
-                now = time.time()
-                if idle_now:
-                    idle_since.setdefault(rk, now)
-                else:
-                    idle_since.pop(rk, None)
-                idle_age = int(now - idle_since[rk]) if rk in idle_since else 0
-
-                ready_count = int(counts.get("ready", counts.get("ava", 0)) or 0)
-                ready_ge_min = ready_count >= READY_MIN_THIS
-                waiting_too_long = idle_age >= IDLE_THRESHOLD_THIS
-                candidate = bool(ready_ge_min or waiting_too_long)
-
-                dbg = {
-                    "mode": "counts_fallback_forced" if agents_path else "counts_fallback",
-                    "ing": ING_THIS,
-                    "state": (st or "BASE"),
-                    "route_key": rk,
-                    "ready_min": READY_MIN_THIS,
-                    "threshold": IDLE_THRESHOLD_THIS,
-                    "ready_ge_min": ready_ge_min,
-                    "idle_now": idle_now,
-                }
-                if raw:
-                    dbg["counts_raw"] = counts
-                    dbg["idle_probe_raw"] = idle_resp
-                return {
-                    "candidate": candidate,
-                    "ready": ready_count,
-                    "maxStatusDuration": idle_age,   # idle seconds as duration proxy
-                    "waitingTooLong": waiting_too_long,
-                    "debug": dbg
-                }
-
             async def eval_state(st: Optional[str]) -> Dict[str, Any]:
                 # 1) counts (always computed)
                 counts = await tld_ready(client, phone, extra={
@@ -413,16 +362,11 @@ async def accept(
 
                     # If the feed shows no READY/CLOSER rows at all, force counts/idle fallback.
                     if max_duration == 0:
-                        return await counts_fallback_eval(st, counts)
-
-                    waiting_too_long = (max_duration >= IDLE_THRESHOLD_THIS) and (max_duration > 0)
-
-                    if max_duration == 0:
-                        # No READY/CLOSER visible → use counts-based idle timer
                         return await counts_fallback_eval(
-                            st, counts, client, ING_THIS, READY_MIN_THIS, IDLE_THRESHOLD_THIS, phone, raw
+                            st, counts, client, ING_THIS, READY_MIN_THIS, IDLE_THRESHOLD_THIS, phone, int(raw or 0)
                         )
 
+                    waiting_too_long = (max_duration >= IDLE_THRESHOLD_THIS)
                     candidate = bool(ready_ge_min or waiting_too_long)
 
                     dbg = {
@@ -448,7 +392,9 @@ async def accept(
                     }
 
                 # 3) counts-based idle fallback (when no live-agents endpoint available at all)
-                return await counts_fallback_eval(st, counts)
+                return await counts_fallback_eval(
+                    st, counts, client, ING_THIS, READY_MIN_THIS, IDLE_THRESHOLD_THIS, phone, int(raw or 0)
+                )
 
             # Evaluate states
             per_state: Dict[str, Dict[str, Any]] = {}
