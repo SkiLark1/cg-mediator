@@ -23,7 +23,7 @@ ALLOW_CAMPAIGN_FALLBACK = os.getenv("ALLOW_CAMPAIGN_FALLBACK", "0") not in ("0",
 CAMPAIGN_TO_ING: Dict[str, str] = {
     "EZSALES": "SREZMEDI_",
     "MTSALES": "SRMEDTI_",
-    "FIVESTARSALES": "SRAHI_",
+    "10": "SRAHI_",
 }
 
 # Statuses that count toward "duration-based acceptance"
