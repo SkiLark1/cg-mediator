@@ -1,0 +1,32 @@
+# /etc/cg-mediator/tenants.yaml
+tenants:
+  five_star:
+    tld_base: "https://5star.tldcrm.com"
+    tld_api_id: "359"
+    tld_api_key: "ea72b187-aeba-463b-95ea-a53bde065d6e"
+    agent_status_path: "/api/egress/tldialer/vicidial_live_agents"
+    allow_campaign_fallback: true
+
+    # Map agnostic campaign_id -> ing base (for CLOSER rows w/ missing ingroup)
+    campaign_to_ing:
+      EZSALES: "SREZMEDI_"
+      MTSALES: "SRMEDTI_"
+      "10":    "SRAHI_"        # Five Star Sales (SRAHI_) you just added
+
+    # Ingroup prefixes (so we can infer tenant if caller doesn’t pass ?tenant=)
+    ing_prefixes:
+      - "SREZMEDI_"
+      - "SRMEDTI_"
+      - "SRAHI_"
+
+  # Example second tenant (different TLD):
+  # anchor:
+  #   tld_base: "https://anchor.tldcrm.com"
+  #   tld_api_id: "123"
+  #   tld_api_key: "xxxxx-xxxxx"
+  #   agent_status_path: "/api/egress/tldialer/vicidial_live_agents"
+  #   allow_campaign_fallback: true
+  #   campaign_to_ing:
+  #     ANCHORSALES: "SRANCH_"
+  #   ing_prefixes:
+  #     - "SRANCH_"
