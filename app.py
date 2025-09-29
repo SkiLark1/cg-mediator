@@ -15,6 +15,16 @@ READY_MIN      = int(os.getenv("READY_MIN", "2"))
 IDLE_THRESHOLD = int(os.getenv("IDLE_THRESHOLD", "60"))  # seconds
 HTTP_TIMEOUT   = float(os.getenv("HTTP_TIMEOUT", "2.0"))
 
+# Anti-overdial / pacing knobs
+MIN_ACCEPT_GAP_MS      = int(os.getenv("MIN_ACCEPT_GAP_MS", "0"))
+MAX_PER_MINUTE         = int(os.getenv("MAX_PER_MINUTE", "0"))
+BURST                  = int(os.getenv("BURST", "0"))  # small short-window burst
+SUSTAINED_READY_SEC    = int(os.getenv("SUSTAINED_READY_SEC", "0"))
+REQUIRE_IDLE_FOR_DURATION = os.getenv("REQUIRE_IDLE_FOR_DURATION", "0") not in ("0","","false","False")
+DEDUP_CALLERID_SEC     = int(os.getenv("DEDUP_CALLERID_SEC", "0"))
+CONCURRENCY_WINDOW_SEC = int(os.getenv("CONCURRENCY_WINDOW_SEC", "0"))
+SAFETY_MARGIN          = int(os.getenv("SAFETY_MARGIN", "0"))
+
 # Egress auth (legacy, used if tenant doesn't override)
 TLD_API_ID  = os.getenv("TLD_API_ID")
 TLD_API_KEY = os.getenv("TLD_API_KEY")
@@ -52,6 +62,13 @@ AGENT_PATH_CACHE_TTL = 300.0  # seconds
 # Counts/idle/ready fallback state (keyed by route_key)
 idle_since: Dict[str, float]  = {}
 ready_since: Dict[str, float] = {}
+
+# Throttle / limiter state
+last_accept_ts: Dict[str, float]   = {}   # route_key -> last accept ts
+minute_bucket: Dict[str, List[float]] = {}   # route_key -> accept timestamps within last 60s
+burst_bucket: Dict[str, List[float]]  = {}   # route_key -> accept timestamps within last 2s (for BURST)
+caller_last_ts: Dict[str, float]     = {}   # phone (normalized) -> ts of last approval
+inflight_approvals: Dict[str, List[float]] = {}  # route_key -> accept timestamps within CONCURRENCY_WINDOW_SEC
 
 # =============================
 # Multi-tenant config (YAML)
@@ -119,7 +136,11 @@ def area_code_from_phone(p: str) -> str:
     m = re.search(r"(\d{10})$", re.sub(r"\D", "", p or ""))
     return (m.group(1)[0:3] if m else "UNK")
 
+def normalized_phone(p: str) -> str:
+    return re.sub(r"\D", "", p or "")
+
 def route_key(ing_base: str, st: Optional[str], phone: str) -> str:
+    # Keyed by ing (and optional state) + area code to avoid one region flooding all routes
     return f"{ing_base}{(st or '')}|{area_code_from_phone(phone)}"
 
 def normalize_rows(data: Any) -> List[Dict[str, Any]]:
@@ -436,8 +457,15 @@ async def accept(
                     except Exception:
                         pass  # keep counts result
 
-                waiting_too_long = effective_max_secs >= IDLE_THRESHOLD_THIS
-                candidate = bool(ready_ge_min or waiting_too_long)
+                # Hysteresis (sustained ready) + optional idle requirement for duration
+                sustained_ready = (ready_count >= READY_MIN_THIS) and (
+                    ready_age >= SUSTAINED_READY_SEC if SUSTAINED_READY_SEC > 0 else True
+                )
+                duration_ok = (effective_max_secs >= IDLE_THRESHOLD_THIS) and (
+                    idle_now if REQUIRE_IDLE_FOR_DURATION else True
+                )
+
+                candidate = bool(sustained_ready or duration_ok)
 
                 dbg = {
                     "mode": source_mode,
@@ -452,6 +480,8 @@ async def accept(
                     "idle_now": idle_now,
                     "idle_age": idle_age,
                     "ready_age": ready_age,
+                    "sustained_ready": sustained_ready,
+                    "duration_ok": duration_ok,
                     "campaign_fallback": bool(ALLOW_FALLBACK_THIS),
                 }
                 if agents_path:
@@ -466,7 +496,7 @@ async def accept(
                     "candidate": candidate,
                     "ready": ready_count,
                     "maxStatusDuration": effective_max_secs,
-                    "waitingTooLong": waiting_too_long,
+                    "waitingTooLong": effective_max_secs >= IDLE_THRESHOLD_THIS,
                     "debug": dbg
                 }
 
@@ -487,6 +517,67 @@ async def accept(
                 overall_maxdur = max(overall_maxdur, res["maxStatusDuration"])
 
             computed_should_accept = overall_candidate
+
+            # ====== LIMITERS (apply after decision, before returning) ======
+            throttle_reason = None
+            now = time.time()
+            phone_norm = normalized_phone(phone)
+
+            # route key for pacing; if multiple states were requested, pace at base-ing level (no state)
+            rk_for_limits = route_key(ING_THIS, state_list[0] if len(state_list) == 1 else None, phone)
+
+            if computed_should_accept:
+                # De-dupe by caller ID (prevents back-to-back same CID)
+                if DEDUP_CALLERID_SEC > 0:
+                    last = caller_last_ts.get(phone_norm)
+                    if last and (now - last < DEDUP_CALLERID_SEC):
+                        computed_should_accept = False
+                        throttle_reason = "callerid_dedupe"
+                    else:
+                        caller_last_ts[phone_norm] = now
+
+            if computed_should_accept and MIN_ACCEPT_GAP_MS > 0:
+                last = last_accept_ts.get(rk_for_limits, 0.0)
+                if (now - last) * 1000 < MIN_ACCEPT_GAP_MS:
+                    computed_should_accept = False
+                    throttle_reason = "min_gap"
+                else:
+                    last_accept_ts[rk_for_limits] = now
+
+            if computed_should_accept and CONCURRENCY_WINDOW_SEC > 0:
+                win = [t for t in inflight_approvals.get(rk_for_limits, []) if now - t < CONCURRENCY_WINDOW_SEC]
+                inflight_approvals[rk_for_limits] = win
+                # Allowed = ready_count - safety; use best ready from per_state
+                best_ready = max((v["ready"] for v in per_state.values()), default=0)
+                allowed = max(0, best_ready - SAFETY_MARGIN)
+                if len(win) >= allowed:
+                    computed_should_accept = False
+                    throttle_reason = "concurrency_cap"
+                else:
+                    win.append(now)
+                    inflight_approvals[rk_for_limits] = win
+
+            if computed_should_accept and MAX_PER_MINUTE > 0:
+                win = [t for t in minute_bucket.get(rk_for_limits, []) if now - t < 60]
+                minute_bucket[rk_for_limits] = win
+                if len(win) >= MAX_PER_MINUTE:
+                    computed_should_accept = False
+                    throttle_reason = "rate_limit_minute"
+                else:
+                    win.append(now)
+                    minute_bucket[rk_for_limits] = win
+
+            if computed_should_accept and BURST > 0:
+                # allow small short-window burst (2s) even if min-gap would otherwise be tight
+                bw = [t for t in burst_bucket.get(rk_for_limits, []) if now - t < 2.0]
+                burst_bucket[rk_for_limits] = bw
+                if len(bw) >= BURST:
+                    # no extra throttle reason; burst exceeded is implicit pacing
+                    pass
+                else:
+                    bw.append(now)
+                    burst_bucket[rk_for_limits] = bw
+
             should_accept = False if dry else computed_should_accept
 
             resp = {
@@ -501,8 +592,21 @@ async def accept(
                     "per_state": per_state,
                     "computed_should_accept": computed_should_accept,
                     "dry_mode": bool(dry),
+                    "limits": {
+                        "min_gap_ms": MIN_ACCEPT_GAP_MS,
+                        "max_per_minute": MAX_PER_MINUTE,
+                        "burst": BURST,
+                        "sustained_ready_sec": SUSTAINED_READY_SEC,
+                        "require_idle_for_duration": bool(REQUIRE_IDLE_FOR_DURATION),
+                        "dedup_callerid_sec": DEDUP_CALLERID_SEC,
+                        "concurrency_window_sec": CONCURRENCY_WINDOW_SEC,
+                        "safety_margin": SAFETY_MARGIN,
+                        "route_key": rk_for_limits,
+                    },
                 }
             }
+            if throttle_reason:
+                resp["debug"]["throttle_reason"] = throttle_reason
             if agents_path:
                 resp["debug"]["agents_endpoint_used"] = agents_path
             return resp
