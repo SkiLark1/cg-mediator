@@ -25,6 +25,13 @@ DEDUP_CALLERID_SEC     = int(os.getenv("DEDUP_CALLERID_SEC", "0"))
 CONCURRENCY_WINDOW_SEC = int(os.getenv("CONCURRENCY_WINDOW_SEC", "0"))
 SAFETY_MARGIN          = int(os.getenv("SAFETY_MARGIN", "0"))
 
+# New safety flags
+STRICT_STATE_MATCH = os.getenv("STRICT_STATE_MATCH", "0") not in ("0","","false","False")
+REQUIRE_READYLIKE_FOR_DURATION = os.getenv("REQUIRE_READYLIKE_FOR_DURATION", "0") not in ("0","","false","False")
+
+# Agents overlay → treat CLOSER/READY rows as "ready" too (min agents required to count)
+READYLIKE_COUNT_MIN = int(os.getenv("READYLIKE_COUNT_MIN", "0"))
+
 # Egress auth (legacy, used if tenant doesn't override)
 TLD_API_ID  = os.getenv("TLD_API_ID")
 TLD_API_KEY = os.getenv("TLD_API_KEY")
@@ -39,7 +46,7 @@ CAMPAIGN_TO_ING_DEFAULT: Dict[str, str] = {
     "10":      "SRAHI_",     # Five Star Sales (Anchor/“SRAHI_”)
 }
 
-# Statuses that count toward "duration-based acceptance"
+# Statuses that count toward "ready-like" (agent overlay)
 READYLIKE_STATUSES = {"closer", "ready"}
 
 # Agent endpoint discovery (tenant can pin exact path)
@@ -213,43 +220,61 @@ def row_matches_ing_state(
     ing_base: str,
     st: Optional[str],
     allow_campaign_fallback: bool,
-    campaign_to_ing: Dict[str, str]
+    campaign_to_ing: Dict[str, str],
+    strict_state: bool
 ) -> bool:
     """
     True if this agent row is associated with the requested ingroup+state.
     First try explicit ingroup fields; if missing and allowed, fall back to campaign→ingroup mapping.
+    With strict_state:
+      - if a state filter (st) is provided, the row must explicitly show that 2-letter suffix
+      - if no state filter is provided, a visible 2-letter suffix must exist on the ingroup label/code
     """
     ing_up = ing_base.upper()
     st_up  = (st or "").upper()
 
-    # explicit ingroup via code (SREZMEDI_FL) or human label ("SR EZMed Inbound   FL")
     code    = pick(row, ["call_campaign_id"]) or ""
     label   = pick(row, ["call_ingroup_group_name"]) or ""
     label_c = collapse_spaces(str(label))
     code_up   = str(code).upper()
     label_up  = label_c.upper()
 
+    # Extract visible state from either field (for strict mode checks)
+    state_from_code  = suffix_after_underscore(code_up)
+    state_from_label = suffix_after_underscore(label_up.replace(" ", "_"))
+    visible_state = state_from_code or state_from_label
+
+    # Matching logic
     if st:
-        if code_up == f"{ing_up}{st_up}":
+        explicit_match = (code_up == f"{ing_up}{st_up}") or label_up.endswith(f" {st_up}")
+        if strict_state:
+            # must explicitly show the same state
+            if not explicit_match:
+                return False
             return True
-        if label_up.endswith(f" {st_up}"):
-            return True
+        else:
+            if explicit_match:
+                return True
     else:
-        if code_up.startswith(ing_up) or label_up.startswith(ing_up):
-            return True
+        prefix_match = code_up.startswith(ing_up) or label_up.startswith(ing_up)
+        if strict_state:
+            # Require that a 2-letter state suffix exists if no explicit state filter given
+            if prefix_match and visible_state:
+                return True
+        else:
+            if prefix_match:
+                return True
 
     # campaign → ingroup fallback (helps for CLOSER rows where ingroup fields are blank)
-    if allow_campaign_fallback:
+    if allow_campaign_fallback and not strict_state:
         campaign = (pick(row, ["campaign_id"]) or "").upper()
         mapped   = campaign_to_ing.get(campaign)
         if mapped and mapped.upper() == ing_up:
-            state_from_code  = suffix_after_underscore(code_up)
-            state_from_label = suffix_after_underscore(label_up.replace(" ", "_"))
-            visible_state = state_from_code or state_from_label
             if st:
                 if visible_state:
                     return visible_state == st_up
-                return True  # no visible state; caller asked specific state → allow
+                # no visible state; allow if caller asked a specific state (kept for legacy behavior)
+                return True
             return True
 
     return False
@@ -273,6 +298,25 @@ async def tld_ready(client: httpx.AsyncClient, base_url: str, phone: str, extra:
     r.raise_for_status()
     return r.json()
 
+async def _try_agents_endpoint(client: httpx.AsyncClient, base_url: str, path: str,
+                               tld_api_id: Optional[str], tld_api_key: Optional[str]) -> Optional[str]:
+    """
+    Try path and path with '?limit=200' to fetch more rows. Cache whichever works.
+    """
+    now = time.time()
+    for candidate in (path + "?limit=200", path):
+        try:
+            url = f"{base_url}{candidate}"
+            r = await client.get(url, timeout=HTTP_TIMEOUT, headers=auth_headers_for(path, tld_api_id, tld_api_key))
+            if r.status_code == 200:
+                rows = normalize_rows(r.json())
+                if isinstance(rows, list) and rows:
+                    _agent_path_cache[base_url] = (candidate, now + AGENT_PATH_CACHE_TTL)
+                    return candidate
+        except httpx.HTTPError:
+            continue
+    return None
+
 async def discover_agents_endpoint(
     client: httpx.AsyncClient,
     base_url: str,
@@ -295,16 +339,10 @@ async def discover_agents_endpoint(
             candidates.append(p)
 
     for path in candidates:
-        try:
-            url = f"{base_url}{path}"
-            r = await client.get(url, timeout=HTTP_TIMEOUT, headers=auth_headers_for(path, tld_api_id, tld_api_key))
-            if r.status_code == 200:
-                rows = normalize_rows(r.json())
-                if isinstance(rows, list):
-                    _agent_path_cache[base_url] = (path, now + AGENT_PATH_CACHE_TTL)
-                    return path
-        except httpx.HTTPError:
-            continue
+        # First, try with limit param; if no good, try plain
+        chosen = await _try_agents_endpoint(client, base_url, path, tld_api_id, tld_api_key)
+        if chosen:
+            return chosen
     return None
 
 async def tld_agents_live(client: httpx.AsyncClient, base_url: str, path: str,
@@ -338,6 +376,9 @@ async def diag_agents_endpoints(tenant: Optional[str] = Query(None), ing: Option
         "base_url": base,
         "preferred": preferred,
         "candidates": [c for c in ([preferred] if preferred else []) + AGENT_ENDPOINT_CANDIDATES],
+        "strict_state_match": bool(STRICT_STATE_MATCH),
+        "require_readylike_for_duration": bool(REQUIRE_READYLIKE_FOR_DURATION),
+        "readylike_count_min": READYLIKE_COUNT_MIN,
     }
 
 @app.get("/accept")
@@ -386,10 +427,9 @@ async def accept(
                     "ing": f"{ING_THIS}{st}" if st else ING_THIS,
                     "sta": "false" if st else "true"
                 })
-                ready_count = int(counts.get("ready", counts.get("ava", 0)) or 0)
-                ready_ge_min = ready_count >= READY_MIN_THIS
+                ready_count_counts_api = int(counts.get("ready", counts.get("ava", 0)) or 0)
 
-                # probe idle now? (queue==0 & ready>=1)
+                # probe idle now? (queue==0 & ready>=1 by counts)
                 idle_probe = await tld_ready(client, TLD_BASE_THIS, phone, extra={
                     "ing": f"{ING_THIS}{st}" if st else ING_THIS,
                     "que": 0, "qui": "ing", "ava": 1, "sta": "false" if st else "true"
@@ -406,15 +446,16 @@ async def accept(
                 rk = route_key(ING_THIS, st, phone)
                 now = time.time()
 
-                # idle timer
+                # idle timer (based on counts idle probe)
                 if idle_now:
                     idle_since.setdefault(rk, now)
                 else:
                     idle_since.pop(rk, None)
                 idle_age = int(now - idle_since[rk]) if rk in idle_since else 0
 
-                # ready timer — as long as at least 1 agent is READY in this ingroup+state
-                if ready_count >= 1:
+                # Default ready timer uses counts; we'll replace with "effective" after overlay
+                ready_age = 0
+                if ready_count_counts_api >= 1:
                     ready_since.setdefault(rk, now)
                 else:
                     ready_since.pop(rk, None)
@@ -423,23 +464,27 @@ async def accept(
                 # baseline effective duration from counts: max of idle & ready ages
                 effective_max_secs = max(idle_age, ready_age)
                 source_mode = "counts_fallback"
+
+                # ---- 2) AGENTS overlay (READY/CLOSER → "ready-like")
+                readylike_count = 0
+                readylike_count_sustained = 0
+                max_ready_secs = 0
                 matched: List[Dict[str, Any]] = []
 
-                # ---- 2) AGENTS overlay (if it actually shows READY/CLOSER)
                 if agents_path:
                     try:
                         rows = await tld_agents_live(client, TLD_BASE_THIS, agents_path, TLD_API_ID_THIS, TLD_API_KEY_THIS)
-                        max_ready_secs = 0
                         for row in rows:
                             status_l = row_status(row)
                             if status_l not in READYLIKE_STATUSES:
                                 continue
-                            if not row_matches_ing_state(row, ING_THIS, st, ALLOW_FALLBACK_THIS, CAMPAIGN_TO_ING_THIS):
+                            if not row_matches_ing_state(row, ING_THIS, st, ALLOW_FALLBACK_THIS, CAMPAIGN_TO_ING_THIS, STRICT_STATE_MATCH):
                                 continue
                             dur = row_status_duration_seconds(row)
-                            if dur is None:
-                                continue
-                            d = int(dur)
+                            d = int(dur or 0)
+                            readylike_count += 1
+                            if SUSTAINED_READY_SEC <= 0 or d >= SUSTAINED_READY_SEC:
+                                readylike_count_sustained += 1
                             if d > max_ready_secs:
                                 max_ready_secs = d
                             if raw:
@@ -452,17 +497,37 @@ async def accept(
                                     "call_ingroup_group_name": pick(row, ["call_ingroup_group_name"]),
                                 })
                         if max_ready_secs > 0:
-                            effective_max_secs = max_ready_secs
+                            effective_max_secs = max(effective_max_secs, max_ready_secs)
                             source_mode = "agents"
                     except Exception:
                         pass  # keep counts result
 
-                # Hysteresis (sustained ready) + optional idle requirement for duration
-                sustained_ready = (ready_count >= READY_MIN_THIS) and (
+                # ---- Effective ready count: include overlay if it meets READYLIKE_COUNT_MIN
+                ready_effective = ready_count_counts_api
+                if READYLIKE_COUNT_MIN > 0 and readylike_count >= READYLIKE_COUNT_MIN:
+                    ready_effective = max(ready_effective, readylike_count)
+
+                # Ready timer should reflect effective readiness (counts OR overlay)
+                if ready_effective >= 1:
+                    ready_since.setdefault(rk, now)
+                else:
+                    ready_since.pop(rk, None)
+                ready_age = int(now - ready_since[rk]) if rk in ready_since else 0
+
+                # Satisfy ready_min via either counts *or* agent-overlay ("ready-like")
+                ready_gate_counts = (ready_count_counts_api >= READY_MIN_THIS) and (
                     ready_age >= SUSTAINED_READY_SEC if SUSTAINED_READY_SEC > 0 else True
                 )
+                ready_gate_agents = (readylike_count >= READY_MIN_THIS) and (
+                    max_ready_secs >= SUSTAINED_READY_SEC if SUSTAINED_READY_SEC > 0 else True
+                )
+                sustained_ready = (ready_gate_counts or ready_gate_agents)
+
+                # Duration fallback (optionally require idle and/or at least one matched ready-like)
                 duration_ok = (effective_max_secs >= IDLE_THRESHOLD_THIS) and (
-                    idle_now if REQUIRE_IDLE_FOR_DURATION else True
+                    (idle_now if REQUIRE_IDLE_FOR_DURATION else True)
+                ) and (
+                    (readylike_count >= 1) if REQUIRE_READYLIKE_FOR_DURATION else True
                 )
 
                 candidate = bool(sustained_ready or duration_ok)
@@ -475,13 +540,19 @@ async def accept(
                     "route_key": rk,
                     "ready_min": READY_MIN_THIS,
                     "threshold": IDLE_THRESHOLD_THIS,
-                    "ready_ge_min": ready_ge_min,
-                    "ready_count": ready_count,
+                    "ready_ge_min": ready_effective >= READY_MIN_THIS,
+                    "ready_count_effective": ready_effective,
+                    "ready_count_counts_api": ready_count_counts_api,
+                    "ready_count_agents_overlay": readylike_count,
+                    "readylike_count_sustained": readylike_count_sustained,
                     "idle_now": idle_now,
                     "idle_age": idle_age,
                     "ready_age": ready_age,
                     "sustained_ready": sustained_ready,
                     "duration_ok": duration_ok,
+                    "strict_state_match": bool(STRICT_STATE_MATCH),
+                    "require_readylike_for_duration": bool(REQUIRE_READYLIKE_FOR_DURATION),
+                    "readylike_count_min": READYLIKE_COUNT_MIN,
                     "campaign_fallback": bool(ALLOW_FALLBACK_THIS),
                 }
                 if agents_path:
@@ -494,7 +565,8 @@ async def accept(
 
                 return {
                     "candidate": candidate,
-                    "ready": ready_count,
+                    "ready": ready_effective,          # <-- effective ready
+                    "readyLike": readylike_count,      # for visibility
                     "maxStatusDuration": effective_max_secs,
                     "waitingTooLong": effective_max_secs >= IDLE_THRESHOLD_THIS,
                     "debug": dbg
@@ -503,6 +575,7 @@ async def accept(
             # evaluate states
             per_state: Dict[str, Dict[str, Any]] = {}
             overall_ready = 0
+            overall_ready_like = 0
             overall_waiting = False
             overall_candidate = False
             overall_maxdur = 0
@@ -512,6 +585,7 @@ async def accept(
                 res = await eval_state(st)
                 per_state[label] = res
                 overall_ready = max(overall_ready, res["ready"])
+                overall_ready_like = max(overall_ready_like, res.get("readyLike", 0))
                 overall_waiting = overall_waiting or res["waitingTooLong"]
                 overall_candidate = overall_candidate or res["candidate"]
                 overall_maxdur = max(overall_maxdur, res["maxStatusDuration"])
@@ -547,9 +621,9 @@ async def accept(
             if computed_should_accept and CONCURRENCY_WINDOW_SEC > 0:
                 win = [t for t in inflight_approvals.get(rk_for_limits, []) if now - t < CONCURRENCY_WINDOW_SEC]
                 inflight_approvals[rk_for_limits] = win
-                # Allowed = ready_count - safety; use best ready from per_state
-                best_ready = max((v["ready"] for v in per_state.values()), default=0)
-                allowed = max(0, best_ready - SAFETY_MARGIN)
+                # Allowed = best available (effective ready vs overlay) - safety
+                best_ready_available = max(overall_ready, overall_ready_like)
+                allowed = max(0, best_ready_available - SAFETY_MARGIN)
                 if len(win) >= allowed:
                     computed_should_accept = False
                     throttle_reason = "concurrency_cap"
@@ -571,18 +645,17 @@ async def accept(
                 # allow small short-window burst (2s) even if min-gap would otherwise be tight
                 bw = [t for t in burst_bucket.get(rk_for_limits, []) if now - t < 2.0]
                 burst_bucket[rk_for_limits] = bw
-                if len(bw) >= BURST:
-                    # no extra throttle reason; burst exceeded is implicit pacing
-                    pass
-                else:
+                if len(bw) < BURST:
                     bw.append(now)
                     burst_bucket[rk_for_limits] = bw
+                # if >= BURST, we don't add; natural pacing
 
             should_accept = False if dry else computed_should_accept
 
             resp = {
                 "shouldAccept": should_accept,
-                "ready": overall_ready,
+                "ready": overall_ready,           # effective ready across states
+                "readyLike": overall_ready_like,  # overlay for visibility
                 "waitingTooLong": overall_waiting,
                 "idleObservedSeconds": overall_maxdur,
                 "debug": {
@@ -598,6 +671,7 @@ async def accept(
                         "burst": BURST,
                         "sustained_ready_sec": SUSTAINED_READY_SEC,
                         "require_idle_for_duration": bool(REQUIRE_IDLE_FOR_DURATION),
+                        "require_readylike_for_duration": bool(REQUIRE_READYLIKE_FOR_DURATION),
                         "dedup_callerid_sec": DEDUP_CALLERID_SEC,
                         "concurrency_window_sec": CONCURRENCY_WINDOW_SEC,
                         "safety_margin": SAFETY_MARGIN,
