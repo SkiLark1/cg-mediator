@@ -55,9 +55,10 @@ AGENT_ENDPOINT_CANDIDATES = [
     "/api/public/report/live_agents",
     "/api/public/report/agents/live",
 ]
-# cache per-base: { base_url: (path, expires_at) }
-_agent_path_cache: Dict[str, Tuple[str, float]] = {}
+# cache per-base: { base_url: (path, expires_at, is_negative) }
+_agent_path_cache: Dict[str, Tuple[Optional[str], float, bool]] = {}
 AGENT_PATH_CACHE_TTL = 300.0  # seconds
+AGENT_PATH_NEGATIVE_TTL = 45.0  # seconds
 
 # Counts/idle/ready fallback state (keyed by route_key)
 idle_since: Dict[str, float]  = {}
@@ -73,7 +74,16 @@ inflight_approvals: Dict[str, List[float]] = {}  # route_key -> accept timestamp
 # =============================
 # Multi-tenant config (YAML)
 # =============================
-CONFIG_PATH = os.getenv("TENANTS_CONFIG", "/etc/cg-mediator/tenants.yaml")
+# Determine where to load tenant configuration from. Historically this
+# defaulted to /etc/cg-mediator/tenants.yaml, but in local/dev contexts the
+# config often ships beside the application code. We keep the legacy default
+# for deployments that mount /etc, while also falling back to the bundled
+# tenants.yaml when present.
+_CONFIG_PATH_ENV = os.getenv("TENANTS_CONFIG")
+_CONFIG_PATH_DEFAULTS = [
+    Path("/etc/cg-mediator/tenants.yaml"),
+    Path(__file__).with_name("tenants.yaml"),
+]
 TENANTS: Dict[str, Any] = {}
 ING_PREFIX_TO_TENANT: Dict[str, str] = {}
 
@@ -81,8 +91,15 @@ def _load_tenants() -> None:
     global TENANTS, ING_PREFIX_TO_TENANT
     TENANTS = {}
     ING_PREFIX_TO_TENANT = {}
-    p = Path(CONFIG_PATH)
-    if p.exists():
+    candidates: List[Path] = []
+    if _CONFIG_PATH_ENV:
+        candidates.append(Path(_CONFIG_PATH_ENV))
+    else:
+        candidates.extend(_CONFIG_PATH_DEFAULTS)
+
+    for p in candidates:
+        if not p.exists():
+            continue
         try:
             with p.open("r") as f:
                 data = yaml.safe_load(f) or {}
@@ -94,6 +111,12 @@ def _load_tenants() -> None:
             # if config is bad, run with zero tenants (fallback to env)
             TENANTS = {}
             ING_PREFIX_TO_TENANT = {}
+        else:
+            return
+
+    # no config found; leave TENANTS empty (env-only legacy mode)
+    TENANTS = {}
+    ING_PREFIX_TO_TENANT = {}
 
 _load_tenants()
 
@@ -282,8 +305,14 @@ async def discover_agents_endpoint(
 ) -> Optional[str]:
     now = time.time()
     cached = _agent_path_cache.get(base_url)
-    if cached and cached[1] > now:
-        return cached[0]
+    if cached:
+        path, expires_at, is_negative = cached
+        if expires_at > now:
+            if is_negative:
+                return None
+            return path
+        else:
+            _agent_path_cache.pop(base_url, None)
 
     candidates: List[str] = []
     if preferred_path:
@@ -294,17 +323,22 @@ async def discover_agents_endpoint(
         if p not in candidates:
             candidates.append(p)
 
+    have_auth = bool(tld_api_id and tld_api_key)
+
     for path in candidates:
+        if not have_auth and path.startswith("/api/egress/"):
+            continue
         try:
             url = f"{base_url}{path}"
             r = await client.get(url, timeout=HTTP_TIMEOUT, headers=auth_headers_for(path, tld_api_id, tld_api_key))
             if r.status_code == 200:
                 rows = normalize_rows(r.json())
                 if isinstance(rows, list):
-                    _agent_path_cache[base_url] = (path, now + AGENT_PATH_CACHE_TTL)
+                    _agent_path_cache[base_url] = (path, now + AGENT_PATH_CACHE_TTL, False)
                     return path
         except httpx.HTTPError:
             continue
+    _agent_path_cache[base_url] = (None, now + AGENT_PATH_NEGATIVE_TTL, True)
     return None
 
 async def tld_agents_live(client: httpx.AsyncClient, base_url: str, path: str,
@@ -329,10 +363,25 @@ async def diag_agents_endpoints(tenant: Optional[str] = Query(None), ing: Option
     preferred = (TENANT.get("agent_status_path") if TENANT else None) or ENV_AGENT_STATUS_PATH
     have_egress_auth = bool((TENANT.get("tld_api_id") if TENANT else TLD_API_ID) and
                             (TENANT.get("tld_api_key") if TENANT else TLD_API_KEY))
-    cached = _agent_path_cache.get(base)
+    cached_entry = _agent_path_cache.get(base)
+    cached_path = None
+    cache_state = None
+    cache_expires_in = None
+    now = time.time()
+    if cached_entry:
+        path, expires_at, is_negative = cached_entry
+        if expires_at > now:
+            cache_state = "negative" if is_negative else "positive"
+            cache_expires_in = max(0, int(expires_at - now))
+            if not is_negative:
+                cached_path = path
+        else:
+            _agent_path_cache.pop(base, None)
     return {
         "tenant": tenant or None,
-        "current_path": cached[0] if cached else None,
+        "current_path": cached_path,
+        "cache_state": cache_state,
+        "cache_expires_in": cache_expires_in,
         "have_egress_auth": have_egress_auth,
         "campaign_fallback": bool(TENANT.get("allow_campaign_fallback", ALLOW_CAMPAIGN_FALLBACK_ENV)),
         "base_url": base,
@@ -422,19 +471,37 @@ async def accept(
 
                 # baseline effective duration from counts: max of idle & ready ages
                 effective_max_secs = max(idle_age, ready_age)
+                counts_effective_max_secs = effective_max_secs
                 source_mode = "counts_fallback"
                 matched: List[Dict[str, Any]] = []
 
-                # ---- 2) AGENTS overlay (if it actually shows READY/CLOSER)
-                if agents_path:
+                # Counts-only evaluation before optional agents overlay
+                sustained_ready = (ready_count >= READY_MIN_THIS) and (
+                    ready_age >= SUSTAINED_READY_SEC if SUSTAINED_READY_SEC > 0 else True
+                )
+                duration_ok_counts = (counts_effective_max_secs >= IDLE_THRESHOLD_THIS) and (
+                    idle_now if REQUIRE_IDLE_FOR_DURATION else True
+                )
+                candidate_counts = bool(sustained_ready or duration_ok_counts)
+
+                duration_ok = duration_ok_counts
+                candidate = candidate_counts
+
+                overlay_called = False
+                if agents_path and (raw or not candidate_counts):
+                    overlay_called = True
                     try:
-                        rows = await tld_agents_live(client, TLD_BASE_THIS, agents_path, TLD_API_ID_THIS, TLD_API_KEY_THIS)
+                        rows = await tld_agents_live(
+                            client, TLD_BASE_THIS, agents_path, TLD_API_ID_THIS, TLD_API_KEY_THIS
+                        )
                         max_ready_secs = 0
                         for row in rows:
                             status_l = row_status(row)
                             if status_l not in READYLIKE_STATUSES:
                                 continue
-                            if not row_matches_ing_state(row, ING_THIS, st, ALLOW_FALLBACK_THIS, CAMPAIGN_TO_ING_THIS):
+                            if not row_matches_ing_state(
+                                row, ING_THIS, st, ALLOW_FALLBACK_THIS, CAMPAIGN_TO_ING_THIS
+                            ):
                                 continue
                             dur = row_status_duration_seconds(row)
                             if dur is None:
@@ -453,19 +520,13 @@ async def accept(
                                 })
                         if max_ready_secs > 0:
                             effective_max_secs = max_ready_secs
+                            duration_ok = (effective_max_secs >= IDLE_THRESHOLD_THIS) and (
+                                idle_now if REQUIRE_IDLE_FOR_DURATION else True
+                            )
+                            candidate = bool(sustained_ready or duration_ok)
                             source_mode = "agents"
                     except Exception:
                         pass  # keep counts result
-
-                # Hysteresis (sustained ready) + optional idle requirement for duration
-                sustained_ready = (ready_count >= READY_MIN_THIS) and (
-                    ready_age >= SUSTAINED_READY_SEC if SUSTAINED_READY_SEC > 0 else True
-                )
-                duration_ok = (effective_max_secs >= IDLE_THRESHOLD_THIS) and (
-                    idle_now if REQUIRE_IDLE_FOR_DURATION else True
-                )
-
-                candidate = bool(sustained_ready or duration_ok)
 
                 dbg = {
                     "mode": source_mode,
@@ -482,10 +543,14 @@ async def accept(
                     "ready_age": ready_age,
                     "sustained_ready": sustained_ready,
                     "duration_ok": duration_ok,
+                    "counts_duration_ok": duration_ok_counts,
+                    "counts_candidate": candidate_counts,
+                    "counts_effective_max_secs": counts_effective_max_secs,
                     "campaign_fallback": bool(ALLOW_FALLBACK_THIS),
                 }
                 if agents_path:
                     dbg["agents_endpoint"] = agents_path
+                    dbg["agents_overlay_called"] = overlay_called
                     if raw and matched:
                         dbg["matched_agents"] = matched[:10]
                 if raw:
