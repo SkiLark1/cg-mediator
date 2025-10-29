@@ -73,7 +73,16 @@ inflight_approvals: Dict[str, List[float]] = {}  # route_key -> accept timestamp
 # =============================
 # Multi-tenant config (YAML)
 # =============================
-CONFIG_PATH = os.getenv("TENANTS_CONFIG", "/etc/cg-mediator/tenants.yaml")
+# Determine where to load tenant configuration from. Historically this
+# defaulted to /etc/cg-mediator/tenants.yaml, but in local/dev contexts the
+# config often ships beside the application code. We keep the legacy default
+# for deployments that mount /etc, while also falling back to the bundled
+# tenants.yaml when present.
+_CONFIG_PATH_ENV = os.getenv("TENANTS_CONFIG")
+_CONFIG_PATH_DEFAULTS = [
+    Path("/etc/cg-mediator/tenants.yaml"),
+    Path(__file__).with_name("tenants.yaml"),
+]
 TENANTS: Dict[str, Any] = {}
 ING_PREFIX_TO_TENANT: Dict[str, str] = {}
 
@@ -81,8 +90,15 @@ def _load_tenants() -> None:
     global TENANTS, ING_PREFIX_TO_TENANT
     TENANTS = {}
     ING_PREFIX_TO_TENANT = {}
-    p = Path(CONFIG_PATH)
-    if p.exists():
+    candidates: List[Path] = []
+    if _CONFIG_PATH_ENV:
+        candidates.append(Path(_CONFIG_PATH_ENV))
+    else:
+        candidates.extend(_CONFIG_PATH_DEFAULTS)
+
+    for p in candidates:
+        if not p.exists():
+            continue
         try:
             with p.open("r") as f:
                 data = yaml.safe_load(f) or {}
@@ -94,6 +110,12 @@ def _load_tenants() -> None:
             # if config is bad, run with zero tenants (fallback to env)
             TENANTS = {}
             ING_PREFIX_TO_TENANT = {}
+        else:
+            return
+
+    # no config found; leave TENANTS empty (env-only legacy mode)
+    TENANTS = {}
+    ING_PREFIX_TO_TENANT = {}
 
 _load_tenants()
 
