@@ -55,9 +55,10 @@ AGENT_ENDPOINT_CANDIDATES = [
     "/api/public/report/live_agents",
     "/api/public/report/agents/live",
 ]
-# cache per-base: { base_url: (path, expires_at) }
-_agent_path_cache: Dict[str, Tuple[str, float]] = {}
+# cache per-base: { base_url: (path_or_none, expires_at) }
+_agent_path_cache: Dict[str, Tuple[Optional[str], float]] = {}
 AGENT_PATH_CACHE_TTL = 300.0  # seconds
+AGENT_PATH_MISS_TTL = 30.0    # seconds for caching probe misses
 
 # Counts/idle/ready fallback state (keyed by route_key)
 idle_since: Dict[str, float]  = {}
@@ -304,8 +305,14 @@ async def discover_agents_endpoint(
 ) -> Optional[str]:
     now = time.time()
     cached = _agent_path_cache.get(base_url)
-    if cached and cached[1] > now:
-        return cached[0]
+    if cached:
+        cached_path, expires_at = cached
+        if expires_at > now:
+            if cached_path is None:
+                return None
+            return cached_path
+        else:
+            _agent_path_cache.pop(base_url, None)
 
     candidates: List[str] = []
     if preferred_path:
@@ -327,6 +334,7 @@ async def discover_agents_endpoint(
                     return path
         except httpx.HTTPError:
             continue
+    _agent_path_cache[base_url] = (None, time.time() + AGENT_PATH_MISS_TTL)
     return None
 
 async def tld_agents_live(client: httpx.AsyncClient, base_url: str, path: str,
@@ -352,9 +360,26 @@ async def diag_agents_endpoints(tenant: Optional[str] = Query(None), ing: Option
     have_egress_auth = bool((TENANT.get("tld_api_id") if TENANT else TLD_API_ID) and
                             (TENANT.get("tld_api_key") if TENANT else TLD_API_KEY))
     cached = _agent_path_cache.get(base)
+    cache_state = None
+    cache_path: Optional[str] = None
+    cache_expires_at: Optional[float] = None
+    cache_ttl_remaining: Optional[float] = None
+    now = time.time()
+    if cached:
+        cached_path, expires_at = cached
+        if expires_at <= now:
+            _agent_path_cache.pop(base, None)
+        else:
+            cache_path = cached_path if cached_path is not None else None
+            cache_expires_at = expires_at
+            cache_ttl_remaining = max(0.0, expires_at - now)
+            cache_state = "miss" if cached_path is None else "path"
     return {
         "tenant": tenant or None,
-        "current_path": cached[0] if cached else None,
+        "current_path": cache_path if cache_state == "path" else None,
+        "cache_state": cache_state,
+        "cache_expires_at": cache_expires_at,
+        "cache_ttl_remaining": cache_ttl_remaining,
         "have_egress_auth": have_egress_auth,
         "campaign_fallback": bool(TENANT.get("allow_campaign_fallback", ALLOW_CAMPAIGN_FALLBACK_ENV)),
         "base_url": base,
