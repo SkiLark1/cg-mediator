@@ -472,10 +472,24 @@ async def accept(
                 source_mode = "counts_fallback"
                 matched: List[Dict[str, Any]] = []
 
+                # Hysteresis (sustained ready) + optional idle requirement for duration
+                sustained_ready = (ready_count >= READY_MIN_THIS) and (
+                    ready_age >= SUSTAINED_READY_SEC if SUSTAINED_READY_SEC > 0 else True
+                )
+                duration_ok = (effective_max_secs >= IDLE_THRESHOLD_THIS) and (
+                    idle_now if REQUIRE_IDLE_FOR_DURATION else True
+                )
+
+                candidate = bool(sustained_ready or duration_ok)
+
                 # ---- 2) AGENTS overlay (if it actually shows READY/CLOSER)
-                if agents_path:
+                overlay_used = False
+                if agents_path and (raw or not candidate):
                     try:
-                        rows = await tld_agents_live(client, TLD_BASE_THIS, agents_path, TLD_API_ID_THIS, TLD_API_KEY_THIS)
+                        rows = await tld_agents_live(
+                            client, TLD_BASE_THIS, agents_path, TLD_API_ID_THIS, TLD_API_KEY_THIS
+                        )
+                        overlay_used = True
                         max_ready_secs = 0
                         for row in rows:
                             status_l = row_status(row)
@@ -504,15 +518,11 @@ async def accept(
                     except Exception:
                         pass  # keep counts result
 
-                # Hysteresis (sustained ready) + optional idle requirement for duration
-                sustained_ready = (ready_count >= READY_MIN_THIS) and (
-                    ready_age >= SUSTAINED_READY_SEC if SUSTAINED_READY_SEC > 0 else True
-                )
-                duration_ok = (effective_max_secs >= IDLE_THRESHOLD_THIS) and (
-                    idle_now if REQUIRE_IDLE_FOR_DURATION else True
-                )
-
-                candidate = bool(sustained_ready or duration_ok)
+                if overlay_used:
+                    duration_ok = (effective_max_secs >= IDLE_THRESHOLD_THIS) and (
+                        idle_now if REQUIRE_IDLE_FOR_DURATION else True
+                    )
+                    candidate = bool(sustained_ready or duration_ok)
 
                 dbg = {
                     "mode": source_mode,
