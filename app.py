@@ -335,7 +335,7 @@ async def _try_agents_endpoint(client: httpx.AsyncClient, base_url: str, path: s
             if r.status_code == 200:
                 rows = normalize_rows(r.json())
                 if isinstance(rows, list) and rows:
-                    _agent_path_cache[base_url] = (candidate, now + AGENT_PATH_CACHE_TTL)
+                    _agent_path_cache[base_url] = (candidate, now + AGENT_PATH_CACHE_TTL, False)
                     return candidate
         except httpx.HTTPError:
             continue
