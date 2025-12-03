@@ -519,8 +519,10 @@ async def accept(
                 max_ready_secs = 0
                 matched: List[Dict[str, Any]] = []
 
+                overlay_called = False
                 if agents_path:
                     try:
+                        overlay_called = True
                         rows = await tld_agents_live(client, TLD_BASE_THIS, agents_path, TLD_API_ID_THIS, TLD_API_KEY_THIS)
                         for row in rows:
                             status_l = row_status(row)
